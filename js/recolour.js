@@ -3,7 +3,8 @@
 import * as store from './store.js';
 import { rgbToLab, labToRgb, hexToLab, swatchCss, rgbToHex, deltaE, matchWords } from './colour.js';
 import { pickFilament } from './picker.js';
-import { el, esc, toast, busy, nextFrame } from './ui.js';
+import { el, esc, toast, busy, nextFrame, download } from './ui.js';
+import { zipSync, unzipSync, strToU8, strFromU8 } from '../vendor/fflate.module.js';
 import { setDesignNeeds } from './library.js';
 
 const MAXW = 1600;
@@ -19,10 +20,12 @@ const adj = { exposure: 0, contrast: 0, saturation: 0 };
 
 // hand-made areas
 let tool = 'pick';        // pick | wand | fill | brush
-const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false };
-let sel = null;           // Uint8Array selection mask
+const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, feather: 0, flat: false };
+let sel = null;           // Uint8Array selection mask, 0-255 (in between = soft edge)
 let areaOf = null;        // Uint8Array: 0 = follow its colour group, n = areas[n-1]
-let areas = [];           // your own groups: { target (or null), lab0 (mean original colour), count, name }
+let areaAlpha = null;     // Uint8Array: how much of its own group's colour a pixel takes (255 = all; less on soft edges)
+let areas = [];           // your own groups: { target (or null), lab0 (mean original colour), count, name, flat }
+let saved = { id: null, name: '' }; // the saved copy this picture belongs to
 let edges = null;         // Float32Array edge strength (0-100ish)
 let hoverA = 0;           // your own group under the mouse in the list (1-based)
 const undoStack = [], redoStack = [];
@@ -38,11 +41,13 @@ export function renderRecolour() {
   root.innerHTML = `
     <div class="split">
       <section class="card canvas-card">
-        <div class="card-head"><h2>Picture</h2>
+        <div class="card-head"><h2>Picture <small class="muted" data-picname></small></h2>
           <div class="row gap wrap">
-            <label class="btn small">Open a picture<input type="file" accept="image/*" hidden data-file></label>
+            <label class="btn small">Open a picture<input type="file" accept="image/*,.fspic" hidden data-file></label>
+            <button class="btn small" data-store disabled title="Keep this picture with all its groups and colours, to come back and edit later">💾 Save</button>
+            <button class="btn ghost small" data-saved title="Your saved pictures">📂 Saved</button>
             <div class="seg" data-view><button data-v="before">Before</button><button data-v="after" class="on">After</button><button data-v="mask">Groups</button></div>
-            <button class="btn ghost small" data-save disabled>Save picture</button>
+            <button class="btn ghost small" data-save disabled title="Download the recoloured picture as a PNG image">⬇ Download image</button>
           </div></div>
         <div class="pic-tools" data-ptools>
           <div class="seg" data-tool>
@@ -62,6 +67,7 @@ export function renderRecolour() {
           <span data-selinfo></span>
           <button class="btn small" data-colour>Colour the selection…</button>
           <button class="btn small ghost" data-mkgroup title="Make the selected pixels into one group of their own (joins parts together)">Make a group</button>
+          <label class="check" title="Colour it as one flat filament colour, without the picture's light and shadow"><input type="checkbox" data-flatsel ${topt.flat ? 'checked' : ''}> One solid colour</label>
           <button class="btn ghost small" data-unarea title="Let the selected pixels follow their colour group again">Back to groups</button>
           <button class="btn ghost small" data-invert>Invert</button>
           <button class="btn ghost small" data-none>Clear selection</button>
@@ -91,11 +97,18 @@ export function renderRecolour() {
       </section>
     </div>`;
   const $ = s => root.querySelector(s);
-  $('[data-file]').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
+  $('[data-file]').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) /\.fspic$/i.test(f.name) ? openFile(f) : loadFile(f); };
   const drop = $('[data-drop]');
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
-  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); const f = [...e.dataTransfer.files].find(f => f.type.startsWith('image')); f && loadFile(f); };
+  drop.ondrop = e => {
+    e.preventDefault(); drop.classList.remove('over');
+    const fs = [...e.dataTransfer.files], p = fs.find(f => /\.fspic$/i.test(f.name)), f = fs.find(f => f.type.startsWith('image'));
+    if (p) openFile(p); else if (f) loadFile(f);
+  };
+  $('[data-store]').onclick = saveNamed;
+  $('[data-saved]').onclick = showSaved;
+  $('[data-flatsel]').onchange = e => { topt.flat = e.target.checked; };
   document.addEventListener('paste', e => {
     if (!document.querySelector('#page-recolour.on')) return;
     const it = [...e.clipboardData.items].find(i => i.type.startsWith('image'));
@@ -116,8 +129,8 @@ export function renderRecolour() {
   window.addEventListener('resize', () => { if (img && document.querySelector('#page-recolour.on')) zv.fitted ? fit() : applyZoom(); });
   $('[data-k]').oninput = e => { $('[data-kv]').textContent = e.target.value; };
   $('[data-k]').onchange = e => { k = +e.target.value; if (img) analyse(); };
-  $('[data-shade]').oninput = e => { shade = +e.target.value; $('[data-shv]').textContent = Math.round(shade * 100) + '%'; draw(); };
-  $('[data-bg]').onchange = e => { ignoreBg = e.target.checked; markBg(); refreshList(); draw(); };
+  $('[data-shade]').oninput = e => { shade = +e.target.value; $('[data-shv]').textContent = Math.round(shade * 100) + '%'; draw(); autosaveSoon(); };
+  $('[data-bg]').onchange = e => { ignoreBg = e.target.checked; markBg(); refreshList(); draw(); autosaveSoon(); };
   let adjT;
   root.querySelectorAll('[data-adj]').forEach(i => i.oninput = () => {
     adj[i.dataset.adj] = +i.value; $(`[data-adjv="${i.dataset.adj}"]`).textContent = i.value;
@@ -135,11 +148,12 @@ export function renderRecolour() {
   $('[data-save]').onclick = savePicture;
   $('[data-colour]').onclick = colourSelection;
   $('[data-mkgroup]').onclick = () => makeGroup();
-  $('[data-unarea]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) if (sel[i]) areaOf[i] = 0; areaVer++; tidyAreas(); sel = null; afterSel(); };
-  $('[data-invert]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) sel[i] = sel[i] ? 0 : 1; afterSel(); };
+  $('[data-unarea]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) if (sel[i] >= 128) areaOf[i] = 0; areaVer++; tidyAreas(); sel = null; afterSel(); };
+  $('[data-invert]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) sel[i] = 255 - sel[i]; afterSel(); };
   $('[data-none]').onclick = () => { if (!sel) return; pushUndo(); sel = null; afterSel(); };
   setupCanvas($('[data-canvas]'));
   setTool('pick');
+  restoreCurrent();
 }
 
 function setTool(t) {
@@ -148,11 +162,12 @@ function setTool(t) {
   root.querySelectorAll('[data-tool] button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   const o = root.querySelector('[data-topts]');
   const outl = `<label class="check"><input type="checkbox" data-to="outlines" ${topt.outlines ? 'checked' : ''}> Show outlines</label>`;
+  const soft = `<label title="Feathers the edge of what you select, so the new colour fades into the next one instead of a hard cut. 0 = hard edge.">Soft edge <input type="range" min="0" max="30" value="${topt.feather}" data-to="feather"><b>${topt.feather}</b> px</label>`;
   o.innerHTML = {
     pick: '',
     wand: `<label>How similar <input type="range" min="1" max="60" value="${topt.tol}" data-to="tol"><b>${topt.tol}</b></label>
-      <label class="check"><input type="checkbox" data-to="contiguous" ${topt.contiguous ? 'checked' : ''}> Only touching pixels</label>`,
-    fill: `<label>Outline strength <input type="range" min="3" max="60" value="${topt.edge}" data-to="edge"><b>${topt.edge}</b></label>${outl}`,
+      <label class="check"><input type="checkbox" data-to="contiguous" ${topt.contiguous ? 'checked' : ''}> Only touching pixels</label>${soft}`,
+    fill: `<label>Outline strength <input type="range" min="3" max="60" value="${topt.edge}" data-to="edge"><b>${topt.edge}</b></label>${soft}${outl}`,
     brush: `<label>Size <input type="range" min="2" max="120" value="${topt.size}" data-to="size"><b>${topt.size}</b></label>`,
     move: '',
   }[t];
@@ -219,9 +234,18 @@ function cursor() {
 
 /* ---------- loading & adjusting ---------- */
 async function loadFile(file) {
+  await decodeImage(file);
+  saved = { id: null, name: '' };
+  showName();
+  await reAdjust();
+  autosaveSoon();
+}
+
+// read a picture into img (scaled to at most MAXW; or exactly w × h when reopening a saved one) and reset the page
+async function decodeImage(file, W, H) {
   const bmp = await createImageBitmap(file);
   const s = Math.min(1, MAXW / Math.max(bmp.width, bmp.height));
-  const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
+  const w = W || Math.round(bmp.width * s), h = H || Math.round(bmp.height * s);
   const cv = new OffscreenCanvas(w, h), cx = cv.getContext('2d');
   cx.drawImage(bmp, 0, 0, w, h);
   const data = cx.getImageData(0, 0, w, h);
@@ -234,21 +258,21 @@ async function loadFile(file) {
     lab0[i * 3] = L[0]; lab0[i * 3 + 1] = L[1]; lab0[i * 3 + 2] = L[2];
     alpha[i] = data.data[p + 3];
   }
-  img = { w, h, lab0, lab: lab0, alpha, data };
-  sel = null; areaOf = new Uint8Array(w * h); areas = []; undoStack.length = 0; redoStack.length = 0; lastCopy = {}; areaVer++; labelsVer++;
-  clusters = [];
+  img = { w, h, lab0, lab: lab0, alpha, data, png: file.type === 'image/png' && !W && s === 1 && bmp.width === w ? file : null };
+  sel = null; areaOf = new Uint8Array(w * h); areaAlpha = new Uint8Array(w * h).fill(255); areas = [];
+  undoStack.length = 0; redoStack.length = 0; lastCopy = {}; areaVer++; labelsVer++;
+  clusters = []; labels = null; hover = -1; hoverA = 0;
   const cv2 = canvasEl();
   cv2.width = w; cv2.height = h; cv2.style.width = w + 'px'; cv2.style.height = h + 'px'; cv2.hidden = false;
   document.querySelector('#page-recolour [data-drop] p').hidden = true;
   box().classList.add('has-pic');
-  ['[data-auto]', '[data-reset]', '[data-save]'].forEach(s => document.querySelector('#page-recolour ' + s).disabled = false);
+  ['[data-auto]', '[data-reset]', '[data-save]', '[data-store]'].forEach(s => document.querySelector('#page-recolour ' + s).disabled = false);
   undoButtons();
   fit();
-  await reAdjust();
 }
 
 // Exposure / contrast / colour strength, applied to a copy used only for telling colours apart.
-async function reAdjust() {
+async function reAdjust(thenAnalyse = true) {
   const { exposure, contrast, saturation } = adj;
   if (!exposure && !contrast && !saturation) img.lab = img.lab0;
   else {
@@ -272,7 +296,7 @@ async function reAdjust() {
     busy(false);
   }
   edges = null;
-  await analyse();
+  if (thenAnalyse) await analyse();
 }
 
 /* ---------- colour groups (k-means in Lab) ---------- */
@@ -442,7 +466,8 @@ function setupCanvas(cv) {
       const region = tool === 'wand' ? wand(x, y) : fillInside(x, y);
       pushUndo();
       if (!sel || !add) sel = new Uint8Array(img.w * img.h);
-      for (const i of region) sel[i] = mode;
+      const m = softMask(region, topt.feather);
+      for (let i = 0; i < m.length; i++) if (m[i]) sel[i] = mode ? Math.max(sel[i], m[i]) : Math.round(sel[i] * (255 - m[i]) / 255);
       afterSel();
       return;
     }
@@ -492,7 +517,7 @@ function dab(cx, cy, r, v) {
   const { w, h } = img, r2 = r * r;
   for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(h - 1, Math.ceil(cy + r)); y++)
     for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(w - 1, Math.ceil(cx + r)); x++)
-      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) sel[y * w + x] = v;
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) sel[y * w + x] = v ? 255 : 0;
 }
 
 function wand(x, y) {
@@ -552,14 +577,42 @@ function afterSel(full = true) {
   let n = 0; if (sel) for (let i = 0; i < sel.length; i++) n += sel[i];
   if (!n) sel = null;
   bar.hidden = !sel;
-  if (sel) bar.querySelector('[data-selinfo]').textContent = `${(n / sel.length * 100).toFixed(n / sel.length < 0.01 ? 2 : 1)}% of the picture selected`;
+  const f = n / 255 / (sel ? sel.length : 1);
+  if (sel) bar.querySelector('[data-selinfo]').textContent = `${(f * 100).toFixed(f < 0.01 ? 2 : 1)}% of the picture selected`;
   draw();
 }
 
+// mean original colour of the selection, weighted by how strongly each pixel is selected
 function selMean() {
-  const { lab0 } = img; let L = 0, A = 0, B = 0, n = 0;
-  for (let i = 0; i < sel.length; i++) if (sel[i]) { L += lab0[i * 3]; A += lab0[i * 3 + 1]; B += lab0[i * 3 + 2]; n++; }
-  return { mean: [L / n, A / n, B / n], n };
+  const { lab0 } = img; let L = 0, A = 0, B = 0, n = 0, wt = 0;
+  for (let i = 0; i < sel.length; i++) if (sel[i]) { const q = sel[i]; L += lab0[i * 3] * q; A += lab0[i * 3 + 1] * q; B += lab0[i * 3 + 2] * q; wt += q; n++; }
+  return { mean: [L / wt, A / wt, B / wt], n };
+}
+
+// A selected region as a 0-255 mask. With feather > 0 the edge is blurred (three box blurs ≈ a gaussian),
+// so the colour fades over about that many pixels each side of the edge.
+function softMask(region, feather) {
+  const { w, h } = img, n = w * h;
+  const m = new Uint8Array(n);
+  for (const i of region) m[i] = 255;
+  if (!feather) return m;
+  const r = Math.max(1, Math.round(feather / 3));
+  let a = Float32Array.from(m), b = new Float32Array(n);
+  const pass = (src, dst, horiz) => {
+    const len = horiz ? w : h, lines = horiz ? h : w, st = horiz ? 1 : w, ls = horiz ? w : 1, win = 2 * r + 1;
+    for (let l = 0; l < lines; l++) {
+      const o = l * ls;
+      let acc = 0;
+      for (let k2 = -r; k2 <= r; k2++) acc += src[o + Math.min(len - 1, Math.max(0, k2)) * st];
+      for (let x = 0; x < len; x++) {
+        dst[o + x * st] = acc / win;
+        acc += src[o + Math.min(len - 1, x + r + 1) * st] - src[o + Math.max(0, x - r) * st];
+      }
+    }
+  };
+  for (let it = 0; it < 3; it++) { pass(a, b, true); pass(b, a, false); }
+  for (let i = 0; i < n; i++) m[i] = a[i] < 1 ? 0 : Math.min(255, Math.round(a[i]));
+  return m;
 }
 
 // Make the selected pixels into one group of their own. Joining groups keeps the colour and name of the biggest part.
@@ -570,16 +623,20 @@ function makeGroup(target) {
   let name;
   if (target === undefined) {
     const tally = new Map(); // 'a<n>' / 'c<n>' -> pixels
-    for (let i = 0; i < sel.length; i++) if (sel[i]) { const key = areaOf[i] ? 'a' + areaOf[i] : 'c' + labels[i]; tally.set(key, (tally.get(key) || 0) + 1); }
+    for (let i = 0; i < sel.length; i++) if (sel[i] >= 128) { const key = areaOf[i] ? 'a' + areaOf[i] : 'c' + labels[i]; tally.set(key, (tally.get(key) || 0) + 1); }
     const [top] = [...tally].sort((a, b) => b[1] - a[1]);
     const src = top && (top[0][0] === 'a' ? areas[+top[0].slice(1) - 1] : clusters[+top[0].slice(1)]);
     target = src && !src.bg ? src.target || null : null;
     name = src && top[0][0] === 'a' ? src.name : undefined;
   }
   pushUndo();
-  areas.push({ target, lab0: mean, count: n, name });
+  areas.push({ target, lab0: mean, count: n, name, flat: topt.flat || undefined });
   const id = areas.length;
-  for (let i = 0; i < sel.length; i++) if (sel[i]) areaOf[i] = id;
+  for (let i = 0; i < sel.length; i++) {
+    const s = sel[i];
+    if (!s || (s < 128 && areaOf[i])) continue; // faint soft edge: don't take pixels away from another of your groups
+    areaOf[i] = id; areaAlpha[i] = s;
+  }
   areaVer++;
   sel = null;
   tidyAreas();
@@ -611,17 +668,17 @@ function tidyAreas() {
 /* ---------- undo / redo (selections, groups and colours) ---------- */
 // The big per-pixel arrays are only copied when they've changed since the last copy.
 function snapshot() {
-  if (lastCopy.areaVer !== areaVer) lastCopy = { ...lastCopy, areaVer, areaOf: areaOf.slice() };
+  if (lastCopy.areaVer !== areaVer) lastCopy = { ...lastCopy, areaVer, areaOf: areaOf.slice(), areaAlpha: areaAlpha.slice() };
   if (lastCopy.labelsVer !== labelsVer) lastCopy = { ...lastCopy, labelsVer, labels: labels.slice() };
   return {
-    areaOf: lastCopy.areaOf, areaVer, labels: lastCopy.labels, labelsVer, k,
+    areaOf: lastCopy.areaOf, areaAlpha: lastCopy.areaAlpha, areaVer, labels: lastCopy.labels, labelsVer, k,
     areas: areas.map(a => ({ ...a })), clusters: clusters.map(c => ({ ...c })), sel: sel && sel.slice(),
   };
 }
 function restore(s) {
-  areaOf = s.areaOf.slice(); labels = s.labels.slice();
+  areaOf = s.areaOf.slice(); areaAlpha = s.areaAlpha.slice(); labels = s.labels.slice();
   areaVer = s.areaVer; labelsVer = s.labelsVer;
-  lastCopy = { areaVer, areaOf: s.areaOf, labelsVer, labels: s.labels };
+  lastCopy = { areaVer, areaOf: s.areaOf, areaAlpha: s.areaAlpha, labelsVer, labels: s.labels };
   areas = s.areas.map(a => ({ ...a })); clusters = s.clusters.map(c => ({ ...c })); sel = s.sel && s.sel.slice();
   if (s.k !== k) {
     k = s.k;
@@ -630,6 +687,7 @@ function restore(s) {
   }
   hover = -1; hoverA = 0;
   afterSel(false); refreshList(); draw();
+  autosaveSoon();
 }
 function pushUndo() {
   if (!img || !labels) return;
@@ -637,6 +695,7 @@ function pushUndo() {
   if (undoStack.length > 40) undoStack.shift();
   redoStack.length = 0;
   undoButtons();
+  autosaveSoon();
 }
 function undo() {
   const u = undoStack.pop(); if (!u) return;
@@ -671,10 +730,10 @@ function renameRow(row, obj, fallback) {
 }
 
 // select a group's pixels; Shift adds to what's already selected
-function selectWhere(test, add) {
+function selectWhere(test, add, val = () => 255) {
   pushUndo();
   if (!sel || !add) sel = new Uint8Array(labels.length);
-  for (let p = 0; p < labels.length; p++) if (test(p)) sel[p] = 1;
+  for (let p = 0; p < labels.length; p++) if (test(p)) sel[p] = Math.max(sel[p], val(p));
   afterSel();
 }
 
@@ -687,6 +746,7 @@ function refreshList() {
   const hatch = 'repeating-linear-gradient(45deg,#ddd 0 4px,#fff 4px 8px)';
   const tline = t => t ? ` · ${esc(t.type)}${t.owned ? '' : ' · ♡ wish list'}` : '';
   const nameBtn = '<button class="icon-btn" data-ren title="Rename">✎</button>';
+  const flatBtn = o => `<button class="icon-btn flat${o.flat ? ' on' : ''}" data-flat title="${o.flat ? 'One solid colour. Click to keep the picture\'s shading instead' : 'Keeps the picture\'s shading. Click for one solid colour'}">${o.flat ? '■' : '◐'}</button>`;
   // pixels still following each colour group (not taken into one of your own groups)
   const live = new Float64Array(clusters.length);
   if (labels) for (let p = 0; p < labels.length; p++) if (!areaOf[p]) live[labels[p]]++;
@@ -698,12 +758,13 @@ function refreshList() {
     r.innerHTML = `<span class="sw big" style="background:${rgbToHex(...labToRgb(...a.lab0))}"></span><span class="arrow">→</span><span class="sw big" style="background:${t ? swatchCss(t.hex) : hatch}"></span>
       <div class="grow"><b data-name>${esc(a.name || auto)}</b>
       <small class="muted">${pct(a.count)}${a.name && t ? ` · ${esc(t.name)}` : ''}${t ? tline(t) : ' · not changed'}</small></div>
-      <span class="acts">${nameBtn}<button class="btn small ghost" data-pick>${t ? 'Change' : 'Choose'}</button>
+      <span class="acts">${nameBtn}${t ? flatBtn(a) : ''}<button class="btn small ghost" data-pick>${t ? 'Change' : 'Choose'}</button>
       <button class="icon-btn" data-sel title="Select this group (Shift adds it to the selection)">⬚</button><button class="icon-btn" data-del title="Remove (its pixels go back to their colour groups)">✕</button></span>`;
     r.querySelector('[data-ren]').onclick = () => renameRow(r, a, auto);
     r.querySelector('[data-name]').ondblclick = () => renameRow(r, a, auto);
     r.querySelector('[data-pick]').onclick = () => chooseArea(j);
-    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey);
+    r.querySelector('[data-flat]')?.addEventListener('click', () => { pushUndo(); a.flat = !a.flat || undefined; refreshList(); draw(); });
+    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey, p => areaAlpha[p]);
     r.querySelector('[data-del]').onclick = () => { pushUndo(); for (let i = 0; i < areaOf.length; i++) if (areaOf[i] === j + 1) areaOf[i] = 0; areaVer++; tidyAreas(); draw(); };
     r.onmouseenter = () => { hoverA = j + 1; draw(); };
     r.onmouseleave = () => { hoverA = 0; draw(); };
@@ -723,12 +784,13 @@ function refreshList() {
       <span class="sw big" style="background:${t ? swatchCss(t.hex) : hatch}"></span>
       <div class="grow"><b data-name>${esc(c.name || auto)}</b>
       <small class="muted">${pct(live[i])} of picture${c.name ? ` · ${esc(auto)}` : ''}${t ? tline(t) : near ? ` · closest you have: ${esc(near.f.name)} (${matchWords(near.d)})` : ''}</small></div>
-      <span class="acts">${nameBtn}${c.bg ? '<button class="link" data-unbg>change it</button>' : `<button class="btn small ghost" data-pick>Choose</button>`}
+      <span class="acts">${nameBtn}${t && !c.bg ? flatBtn(c) : ''}${c.bg ? '<button class="link" data-unbg>change it</button>' : `<button class="btn small ghost" data-pick>Choose</button>`}
       <button class="icon-btn" data-split title="Split this group in two (when two colours got lumped together)">⫽</button>
       <button class="icon-btn" data-gsel title="Select this group (Shift adds it to the selection, to join groups)">⬚</button>
       ${t ? '<button class="icon-btn" data-clear title="Put the original colour back">↺</button>' : ''}</span>`;
     r.querySelector('[data-ren]').onclick = () => renameRow(r, c, auto);
     r.querySelector('[data-name]').ondblclick = () => renameRow(r, c, auto);
+    r.querySelector('[data-flat]')?.addEventListener('click', () => { pushUndo(); c.flat = !c.flat || undefined; refreshList(); draw(); });
     r.querySelector('[data-pick]')?.addEventListener('click', () => choose(i));
     r.querySelector('[data-clear]')?.addEventListener('click', () => { pushUndo(); c.target = null; refreshList(); draw(); });
     r.querySelector('[data-unbg]')?.addEventListener('click', () => { c.bg = false; refreshList(); draw(); });
@@ -798,34 +860,239 @@ function draw() {
   const E = showEdges ? edgeMap() : null;
   const cache = new Map();
   const sL = 0.35 + shade * 0.65, sC = shade * 0.5;
+  // new colour of pixel i in group g (cluster c, or your group ar), keeping the picture's shading unless it's solid
+  const recol = (i, ar, c, r0, g0, b0) => {
+    const T = ar ? atl[ar - 1] : ctl[c];
+    if (!T) return null;
+    const key = (ar ? (256 + ar) : c) * 16777216 + ((r0 << 16) | (g0 << 8) | b0);
+    let v = cache.get(key);
+    if (!v) {
+      const G = ar ? areas[ar - 1] : clusters[c], C = G.lab0;
+      v = G.flat ? labToRgb(...T)
+        : labToRgb(Math.max(0, Math.min(100, T[0] + (lab0[i * 3] - C[0]) * sL)), T[1] + (lab0[i * 3 + 1] - C[1]) * sC, T[2] + (lab0[i * 3 + 2] - C[2]) * sC);
+      cache.set(key, v);
+    }
+    return v;
+  };
   for (let i = 0; i < w * h; i++) {
     const p = i * 4, c = labels[i], ar = areaOf ? areaOf[i] : 0;
+    const al = ar ? areaAlpha[i] / 255 : 1; // soft edge: part your group's colour, part what's underneath
     let r = src[p], g = src[p + 1], b = src[p + 2];
-    if (view === 'mask') { [r, g, b] = ar ? mka[ar - 1] : mk[c]; }
-    else if (view === 'after') {
-      const T = ar ? atl[ar - 1] : ctl[c];
-      if (T) {
-        const key = (ar ? (256 + ar) : c) * 16777216 + ((r << 16) | (g << 8) | b);
-        let v = cache.get(key);
-        if (!v) {
-          const C = ar ? areas[ar - 1].lab0 : clusters[c].lab0;
-          v = labToRgb(Math.max(0, Math.min(100, T[0] + (lab0[i * 3] - C[0]) * sL)), T[1] + (lab0[i * 3 + 1] - C[1]) * sC, T[2] + (lab0[i * 3 + 2] - C[2]) * sC);
-          cache.set(key, v);
-        }
-        [r, g, b] = v;
+    if (view === 'mask') {
+      [r, g, b] = ar ? mka[ar - 1] : mk[c];
+      if (al < 1) { const u = mk[c]; r = r * al + u[0] * (1 - al); g = g * al + u[1] * (1 - al); b = b * al + u[2] * (1 - al); }
+    } else if (view === 'after') {
+      const r0 = r, g0 = g, b0 = b;
+      const v = recol(i, ar, c, r0, g0, b0);
+      if (v) [r, g, b] = v;
+      if (al < 1) {
+        const u = recol(i, 0, c, r0, g0, b0) || [r0, g0, b0];
+        r = r * al + u[0] * (1 - al); g = g * al + u[1] * (1 - al); b = b * al + u[2] * (1 - al);
       }
     }
     if ((hoverA && ar !== hoverA) || (!hoverA && hover >= 0 && (c !== hover || ar))) { r = r * 0.35 + 38; g = g * 0.35 + 38; b = b * 0.35 + 38; }
     if (E && E[i] >= topt.edge) { r = 255; g = 40; b = 120; }
     if (sel) {
-      if (sel[i]) { // blue tint + checker so it reads on any colour
-        const ch = ((i % w) >> 2 ^ (Math.floor(i / w) >> 2)) & 1;
-        r = r * 0.5 + (ch ? 40 : 70) * 0.5; g = g * 0.5 + (ch ? 140 : 170) * 0.5; b = b * 0.5 + 255 * 0.5;
-      } else { r *= 0.75; g *= 0.75; b *= 0.75; }
+      // blue tint + checker so it reads on any colour (fading out over a soft edge); the rest dimmed
+      const q = sel[i] / 255, ch = ((i % w) >> 2 ^ (Math.floor(i / w) >> 2)) & 1;
+      const d = 0.75 + 0.25 * q, t = 0.5 * q;
+      r = r * d * (1 - t) + (ch ? 40 : 70) * t; g = g * d * (1 - t) + (ch ? 140 : 170) * t; b = b * d * (1 - t) + 255 * t;
     }
     o[p] = r; o[p + 1] = g; o[p + 2] = b; o[p + 3] = src[p + 3];
   }
   cx.putImageData(out, 0, 0);
+}
+
+/* ---------- saving your work (kept in this browser; or as a .fspic file) ---------- */
+function db() {
+  return new Promise((res, rej) => { const r = indexedDB.open('filament-studio', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+}
+async function dbGet(key) {
+  const d = await db();
+  return new Promise(r => { const q = d.transaction('kv').objectStore('kv').get(key); q.onsuccess = () => r(q.result); q.onerror = () => r(undefined); });
+}
+async function dbPut(key, val) {
+  const d = await db();
+  return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite'); val === undefined ? t.objectStore('kv').delete(key) : t.objectStore('kv').put(val, key); t.oncomplete = res; t.onerror = () => rej(t.error); });
+}
+const listKey = 'recolour:list';
+
+function showName() {
+  const n = document.querySelector('#page-recolour [data-picname]');
+  if (n) n.textContent = saved.id ? `· ${saved.name} (changes save by themselves)` : img ? '· not saved yet' : '';
+}
+
+async function pngOf() {
+  if (!img.png) { const c = new OffscreenCanvas(img.w, img.h); c.getContext('2d').putImageData(img.data, 0, 0); img.png = await c.convertToBlob({ type: 'image/png' }); }
+  return img.png;
+}
+// small picture of the result for the Saved list
+function thumbnail() {
+  const was = [hover, hoverA, sel, view];
+  hover = -1; hoverA = 0; sel = null; view = 'after'; draw();
+  const s = Math.min(1, 220 / Math.max(img.w, img.h)), t = el('canvas', { width: Math.round(img.w * s), height: Math.round(img.h * s) });
+  t.getContext('2d').drawImage(canvasEl(), 0, 0, t.width, t.height);
+  [hover, hoverA, sel, view] = was; draw();
+  return t.toDataURL('image/jpeg', 0.8);
+}
+async function stateNow(withThumb) {
+  return {
+    v: 1, id: saved.id, name: saved.name, date: Date.now(), w: img.w, h: img.h, png: await pngOf(),
+    labels, areaOf, areaAlpha, k, adj: { ...adj }, shade, ignoreBg,
+    clusters: clusters.map(c => ({ ...c })), areas: areas.map(a => ({ ...a })),
+    thumb: withThumb ? thumbnail() : undefined,
+  };
+}
+async function writeSaved(st) {
+  await dbPut('recolour:' + st.id, st);
+  const list = (await dbGet(listKey)) || [];
+  const entry = { id: st.id, name: st.name, date: st.date, thumb: st.thumb || list.find(e => e.id === st.id)?.thumb };
+  await dbPut(listKey, [entry, ...list.filter(e => e.id !== st.id)]);
+}
+
+let autoT;
+function autosaveSoon() {
+  clearTimeout(autoT);
+  autoT = setTimeout(async () => {
+    if (!img || !labels) return;
+    try {
+      const st = await stateNow(!!saved.id);
+      await dbPut('recolour:current', st);
+      if (saved.id) await writeSaved(st);
+    } catch (e) { console.warn('autosave', e); }
+  }, 1200);
+}
+
+async function saveNamed() {
+  if (!img || !labels) return;
+  if (!saved.id) {
+    const name = await askName('Save this picture as', 'My picture ' + new Date().toLocaleDateString());
+    if (!name) return;
+    saved = { id: store.uid(), name };
+  }
+  busy('Saving…'); await nextFrame();
+  try { const st = await stateNow(true); await writeSaved(st); await dbPut('recolour:current', st); toast(`Saved “${saved.name}”`); }
+  catch (e) { toast('Couldn\'t save: ' + e.message); }
+  busy(false); showName();
+}
+
+async function restoreState(st) {
+  busy('Opening…'); await nextFrame();
+  await decodeImage(st.png, st.w, st.h);
+  img.png = st.png;
+  Object.assign(adj, st.adj || {}); shade = st.shade ?? shade; ignoreBg = st.ignoreBg ?? ignoreBg; k = st.k || k;
+  const R = document.getElementById('page-recolour');
+  R.querySelectorAll('[data-adj]').forEach(i => { i.value = adj[i.dataset.adj]; R.querySelector(`[data-adjv="${i.dataset.adj}"]`).textContent = adj[i.dataset.adj]; });
+  R.querySelector('[data-shade]').value = shade; R.querySelector('[data-shv]').textContent = Math.round(shade * 100) + '%';
+  R.querySelector('[data-bg]').checked = ignoreBg;
+  R.querySelector('[data-k]').value = Math.min(24, k); R.querySelector('[data-kv]').textContent = k;
+  await reAdjust(false);
+  // filaments may have changed since (bought one, renamed it): use the library's copy where there is one
+  const fresh = t => t && (store.spoolById(t.id) || t);
+  labels = new Uint8Array(st.labels); areaOf = new Uint8Array(st.areaOf); areaAlpha = new Uint8Array(st.areaAlpha);
+  clusters = st.clusters.map(c => ({ ...c, target: fresh(c.target) }));
+  areas = st.areas.map(a => ({ ...a, target: fresh(a.target) }));
+  labelsVer++; areaVer++; lastCopy = {};
+  saved = { id: st.id || null, name: st.name || '' };
+  busy(false);
+  showName(); refreshList(); draw();
+}
+
+async function openSaved(id) {
+  const st = await dbGet('recolour:' + id);
+  if (!st) return toast('That one isn\'t here any more');
+  await restoreState(st);
+  autosaveSoon();
+}
+
+// back where you were after a reload
+async function restoreCurrent() {
+  try { const st = await dbGet('recolour:current'); if (st && !img) await restoreState(st); } catch (e) { console.warn(e); busy(false); }
+}
+
+async function fileBytes() {
+  const st = await stateNow(false);
+  const meta = { ...st, png: undefined, labels: undefined, areaOf: undefined, areaAlpha: undefined, thumb: undefined, app: 'Filament Studio' };
+  return zipSync({
+    'picture.json': strToU8(JSON.stringify(meta)), 'picture.png': new Uint8Array(await st.png.arrayBuffer()),
+    'labels.bin': labels, 'groups.bin': areaOf, 'soft.bin': areaAlpha,
+  });
+}
+async function openFile(file) {
+  try {
+    const z = unzipSync(new Uint8Array(await file.arrayBuffer()));
+    const meta = JSON.parse(strFromU8(z['picture.json']));
+    await restoreState({ ...meta, png: new Blob([z['picture.png']], { type: 'image/png' }), labels: z['labels.bin'], areaOf: z['groups.bin'], areaAlpha: z['soft.bin'], id: null, name: '' });
+    saved = { id: null, name: '' }; showName();
+    toast('Opened. Press 💾 Save to keep it in this browser.');
+    autosaveSoon();
+  } catch (e) { busy(false); toast('That file couldn\'t be opened'); console.warn(e); }
+}
+
+function askName(title, value = '') {
+  return new Promise(resolve => {
+    const back = el('div', { class: 'modal-back' }), m = el('div', { class: 'modal small-modal' });
+    m.innerHTML = `<div class="modal-head"><h3>${esc(title)}</h3><button class="icon-btn" data-x>✕</button></div>
+      <div class="modal-body"><input class="input" data-n maxlength="60" value="${esc(value)}"></div>
+      <div class="modal-foot"><button class="btn ghost" data-x>Cancel</button> <button class="btn" data-ok>Save</button></div>`;
+    back.append(m); document.body.append(back);
+    const inp = m.querySelector('[data-n]'); inp.focus(); inp.select();
+    const done = v => { back.remove(); resolve(v); };
+    m.querySelectorAll('[data-x]').forEach(b => b.onclick = () => done(null));
+    m.querySelector('[data-ok]').onclick = () => done(inp.value.trim() || null);
+    inp.onkeydown = e => { if (e.key === 'Enter') done(inp.value.trim() || null); if (e.key === 'Escape') done(null); };
+  });
+}
+
+async function showSaved() {
+  const back = el('div', { class: 'modal-back' }), m = el('div', { class: 'modal' });
+  back.append(m); document.body.append(back);
+  const close = () => back.remove();
+  back.addEventListener('pointerdown', e => { if (e.target === back) close(); });
+  const render = async () => {
+    const list = (await dbGet(listKey)) || [];
+    m.innerHTML = `<div class="modal-head"><h3>Saved pictures</h3><button class="icon-btn" data-x>✕</button></div>
+      <div class="modal-body">${list.length ? '' : '<p class="muted">Nothing saved yet. Open a picture, colour it, then press 💾 Save. After that, your changes save by themselves.</p>'}
+        <div class="saved-list"></div></div>
+      <div class="modal-foot row gap wrap"><span class="muted tiny grow" style="text-align:left">Kept in this browser. Save to a file to move one to another computer or keep a backup.</span>
+        ${img && labels ? '<button class="btn ghost small" data-copy>Save as a copy…</button><button class="btn ghost small" data-tofile>⬇ Save to a file</button>' : ''}
+        <label class="btn ghost small">Open a file<input type="file" accept=".fspic" hidden data-fromfile></label></div>`;
+    m.querySelector('[data-x]').onclick = close;
+    const sl = m.querySelector('.saved-list');
+    for (const e of list) {
+      const r = el('div', { class: 'saved-row' + (e.id === saved.id ? ' on' : '') });
+      r.innerHTML = `${e.thumb ? `<img src="${e.thumb}" alt="">` : '<span class="ph"></span>'}
+        <div class="grow"><b>${esc(e.name)}</b><small class="muted">${new Date(e.date).toLocaleString()}${e.id === saved.id ? ' · open now' : ''}</small></div>
+        <button class="btn small" data-open>Open</button><button class="icon-btn" data-ren title="Rename">✎</button><button class="icon-btn" data-del title="Delete">🗑</button>`;
+      r.querySelector('[data-open]').onclick = async () => { close(); await openSaved(e.id); };
+      r.querySelector('[data-ren]').onclick = async () => {
+        const n = await askName('Rename', e.name); if (!n) return;
+        const st = await dbGet('recolour:' + e.id); if (st) { st.name = n; await dbPut('recolour:' + e.id, st); }
+        await dbPut(listKey, list.map(x => x.id === e.id ? { ...x, name: n } : x));
+        if (saved.id === e.id) { saved.name = n; showName(); autosaveSoon(); }
+        render();
+      };
+      r.querySelector('[data-del]').onclick = async () => {
+        if (!confirm(`Delete “${e.name}”? This can't be undone.`)) return;
+        await dbPut('recolour:' + e.id, undefined);
+        await dbPut(listKey, list.filter(x => x.id !== e.id));
+        if (saved.id === e.id) { saved = { id: null, name: '' }; showName(); }
+        render();
+      };
+      sl.append(r);
+    }
+    m.querySelector('[data-copy]')?.addEventListener('click', async () => {
+      const n = await askName('Save a copy as', (saved.name || 'My picture') + ' copy'); if (!n) return;
+      saved = { id: store.uid(), name: n };
+      await saveNamed(); render();
+    });
+    m.querySelector('[data-tofile]')?.addEventListener('click', async () => {
+      const bytes = await fileBytes();
+      download(`${(saved.name || 'picture').replace(/[^\w\- ]+/g, '').trim() || 'picture'}.fspic`, bytes);
+    });
+    m.querySelector('[data-fromfile]').onchange = e => { const f = e.target.files[0]; if (f) { close(); openFile(f); } };
+  };
+  render();
 }
 
 function savePicture() {

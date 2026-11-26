@@ -179,3 +179,13 @@ table.est { width: 100%; border-collapse: collapse; } table.est td, table.est th
 .tiny-h { font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: .4rem 0 .2rem; }
 .areas { display: grid; gap: .35rem; }
 .cl .icon-btn { padding: .2rem .3rem; }
+/* saved pictures */
+.modal.small-modal { width: min(420px, 100%); }
+.modal .input { width: 100%; box-sizing: border-box; }
+.saved-list { display: grid; gap: .45rem; }
+.saved-row { display: flex; align-items: center; gap: .6rem; border: 1px solid var(--line); border-radius: 10px; padding: .4rem .5rem; }
+.saved-row.on { border-color: var(--accent); background: var(--accent-soft); }
+.saved-row img, .saved-row .ph { width: 88px; height: 60px; object-fit: contain; border-radius: 6px; background: repeating-conic-gradient(#f3f1f7 0 25%, #fff 0 50%) 0 0 / 12px 12px; flex: none; }
+.saved-row small { display: block; font-size: .74rem; }
+.cl .icon-btn.flat.on { color: var(--accent); background: var(--accent-soft); }
+.sel-bar label.check { font-weight: 600; color: #2d4f9a; }
