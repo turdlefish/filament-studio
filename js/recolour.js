@@ -212,8 +212,8 @@ function setTool(t) {
   }));
   root.querySelector('[data-hint]').textContent = {
     pick: 'Click the picture to choose a filament for that colour group.',
-    wand: 'Click a colour to select it. Shift-click adds more, Alt-click takes away. Then press "Colour the selection".',
-    fill: 'Click inside an outlined area to select it (stops at lines and edges). Lower the outline strength if it leaks out. Shift adds, Alt takes away.',
+    wand: 'Click a colour to select it; keep the button down and drag to add more patches. Shift-click adds, Alt takes away. Then press "Colour the selection".',
+    fill: 'Click inside an outlined area to select it (stops at lines and edges); drag across more areas to add them. Lower the outline strength if it leaks out. Shift adds, Alt takes away.',
     brush: 'Drag to paint a selection. Hold Alt to rub it out.',
     move: 'Drag to move around. Scroll the mouse wheel (or pinch) to zoom.',
   }[t] + (t === 'move' ? '' : ' Scroll to zoom; hold Space or the right mouse button and drag to move around.');
@@ -513,7 +513,12 @@ function markBg() {
 
 /* ---------- selection tools ---------- */
 function setupCanvas(cv) {
-  let painting = false, mode = 1, last = null;
+  let painting = false, mode = 1, last = null, wanding = null;
+  // add (or with Alt take away) the wand / fill region at a point
+  const wandAt = (x, y) => {
+    const region = tool === 'wand' ? wand(x, y) : fillInside(x, y);
+    for (const i of region) sel[i] = mode ? 255 : 0;
+  };
   let pan = null;                 // { x, y, zx, zy } while dragging the picture around
   const touches = new Map();      // pointerId -> [x, y] for pinch zoom
   let pinch = null;
@@ -532,7 +537,7 @@ function setupCanvas(cv) {
     if (e.pointerType === 'touch') {
       touches.set(e.pointerId, local(e));
       if (touches.size === 2) { // second finger: stop painting, start pinching
-        if (painting) { painting = false; afterSel(); }
+        if (painting) { painting = false; afterSel(); } if (wanding) { cancelAnimationFrame(wanding.raf); wanding = null; afterSel(); }
         pan = null;
         const [p1, p2] = [...touches.values()];
         pinch = { d: Math.hypot(p1[0] - p2[0], p1[1] - p2[1]), mx: (p1[0] + p2[0]) / 2, my: (p1[1] + p2[1]) / 2 };
@@ -557,12 +562,13 @@ function setupCanvas(cv) {
       hover = labels[i0]; hoverA = 0; refreshList(); draw(); document.querySelector(`#page-recolour [data-ci="${hover}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); choose(hover); return;
     }
     if (tool === 'wand' || tool === 'fill') {
-      const region = tool === 'wand' ? wand(x, y) : fillInside(x, y);
+      // click selects; keep the button down and drag to add more patches (Alt-drag takes them away)
       pushUndo();
       if (!sel || !add) sel = new Uint8Array(img.w * img.h);
-      const m = softMask(region);
-      for (let i = 0; i < m.length; i++) if (m[i]) sel[i] = mode ? Math.max(sel[i], m[i]) : Math.round(sel[i] * (255 - m[i]) / 255);
-      afterSel();
+      wandAt(x, y);
+      wanding = { last: [x, y], next: null, raf: 0 };
+      b.setPointerCapture(e.pointerId);
+      afterSel(false);
       return;
     }
     if (tool === 'brush') {
@@ -589,6 +595,20 @@ function setupCanvas(cv) {
       applyZoom();
       return;
     }
+    if (wanding) {
+      const [x, y] = pos(e);
+      if (x < 0 || y < 0 || x >= img.w || y >= img.h || Math.hypot(x - wanding.last[0], y - wanding.last[1]) < 3) return;
+      wanding.next = [x, y];
+      if (!wanding.raf) wanding.raf = requestAnimationFrame(() => {
+        if (!wanding) return;
+        wanding.raf = 0;
+        const p = wanding.next; if (!p) return;
+        wanding.next = null; wanding.last = p;
+        // only where it would change something
+        if ((sel[p[1] * img.w + p[0]] >= 128) !== !!mode) { wandAt(p[0], p[1]); afterSel(false); }
+      });
+      return;
+    }
     if (!painting) return;
     const [x, y, scale] = pos(e), r = topt.size * scale / 2;
     // fill the gap between fast pointer samples
@@ -602,6 +622,11 @@ function setupCanvas(cv) {
     if (touches.size < 2) pinch = null;
     if (pan) { pan = null; cursor(); }
     if (painting) { painting = false; afterSel(); }
+    if (wanding) {
+      const p = wanding.next; cancelAnimationFrame(wanding.raf); wanding = null;
+      if (p && (sel[p[1] * img.w + p[0]] >= 128) !== !!mode) wandAt(p[0], p[1]);
+      afterSel();
+    }
   };
   b.addEventListener('pointerup', up);
   b.addEventListener('pointercancel', up);
@@ -738,7 +763,7 @@ function makeGroup(target) {
     name = src && top[0][0] === 'a' ? src.name : undefined;
   }
   pushUndo();
-  areas.push({ target, lab0: mean, count: n, name, flat: topt.flat || undefined });
+  areas.push({ target, lab0: mean, count: n, name, flat: topt.flat || undefined, feather: topt.feather || undefined });
   const id = areas.length, soft = selNow();
   for (let i = 0; i < soft.length; i++) {
     const s = soft[i];
@@ -837,6 +862,20 @@ function renameRow(row, obj, fallback) {
   inp.onblur = () => finish(true);
 }
 
+// Change the soft edge of one of your groups after it's made: take its hard shape (pixels at least half in it),
+// blur that by the new amount, and let the fade reach into neighbouring pixels that aren't in another of your groups.
+function refeather(j, f) {
+  const id = j + 1, n = areaOf.length, hard = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (areaOf[i] === id && areaAlpha[i] >= 128) hard[i] = 255;
+  const m = blurMask(hard, f);
+  for (let i = 0; i < n; i++) {
+    if (areaOf[i] === id) { if (m[i]) areaAlpha[i] = m[i]; else areaOf[i] = 0; }
+    else if (!areaOf[i] && m[i]) { areaOf[i] = id; areaAlpha[i] = m[i]; }
+  }
+  areas[j].feather = f || undefined;
+  areaVer++;
+}
+
 // select a group's pixels; Shift adds to what's already selected
 function selectWhere(test, add, val = () => 255) {
   pushUndo();
@@ -867,11 +906,26 @@ function refreshList() {
       <div class="grow"><b data-name>${esc(a.name || auto)}</b>
       <small class="muted">${pct(a.count)}${a.name && t ? ` · ${esc(t.name)}` : ''}${t ? tline(t) : ' · not changed'}</small></div>
       <span class="acts">${nameBtn}${t ? flatBtn(a) : ''}<button class="btn small ghost" data-pick>${t ? 'Change' : 'Choose'}</button>
-      <button class="icon-btn" data-sel title="Select this group (Shift adds it to the selection)">⬚</button><button class="icon-btn" data-del title="Remove (its pixels go back to their colour groups)">✕</button></span>`;
+      <button class="icon-btn${a.softOpen ? ' on' : ''}" data-soft title="Soft edge: fade this group's edge into what's next to it">≈</button><button class="icon-btn" data-sel title="Select this group (Shift adds it to the selection)">⬚</button><button class="icon-btn" data-del title="Remove (its pixels go back to their colour groups)">✕</button></span>`;
     r.querySelector('[data-ren]').onclick = () => renameRow(r, a, auto);
     r.querySelector('[data-name]').ondblclick = () => renameRow(r, a, auto);
     r.querySelector('[data-pick]').onclick = () => chooseArea(j);
     r.querySelector('[data-flat]')?.addEventListener('click', () => { pushUndo(); a.flat = !a.flat || undefined; refreshList(); draw(); });
+    r.querySelector('[data-soft]').onclick = () => { a.softOpen = !a.softOpen || undefined; refreshList(); };
+    if (a.softOpen) {
+      const sr = el('label', { class: 'soft-row' });
+      sr.innerHTML = `Soft edge <input type="range" min="0" max="30" value="${a.feather || 0}"><b>${a.feather || 0}</b> px <span class="muted">(0 = hard edge)</span>`;
+      const rg = sr.querySelector('input');
+      let undone = false, raf = 0;
+      rg.oninput = () => {
+        if (!undone) { pushUndo(); undone = true; }
+        hoverA = 0; // see it against its neighbours, not dimmed
+        sr.querySelector('b').textContent = rg.value;
+        cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { refeather(j, +rg.value); draw(); });
+      };
+      rg.onchange = () => { undone = false; cancelAnimationFrame(raf); refeather(j, +rg.value); draw(); tidyAreas(); autosaveSoon(); };
+      r.append(sr);
+    }
     r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey, p => areaAlpha[p] >= 128 ? 255 : 0);
     r.querySelector('[data-del]').onclick = () => { pushUndo(); for (let i = 0; i < areaOf.length; i++) if (areaOf[i] === j + 1) areaOf[i] = 0; areaVer++; tidyAreas(); draw(); };
     r.onmouseenter = () => { hoverA = j + 1; draw(); };
