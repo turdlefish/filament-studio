@@ -25,6 +25,7 @@ const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, f
 let sel = null;           // Uint8Array selection mask, 0-255 (in between = soft edge)
 let areaOf = null;        // Uint8Array: 0 = follow its colour group, n = areas[n-1]
 let areaAlpha = null;     // Uint8Array: how much of its own group's colour a pixel takes (255 = all; less on soft edges)
+let areaCore = null;      // Uint8Array: 1 = inside the group's own shape as you made it (soft edges are worked out from this, so they never wear it away)
 let areas = [];           // your own groups: { target (or null), lab0 (mean original colour), count, name, flat }
 let saved = { id: null, name: '' }; // the saved copy this picture belongs to
 let edges = null;         // Float32Array edge strength (0-100ish)
@@ -130,7 +131,7 @@ export function renderRecolour() {
     if (it) loadFile(it.getAsFile());
   });
   document.addEventListener('keydown', e => {
-    if (!document.querySelector('#page-recolour.on') || e.target.matches?.('input, select, textarea')) return;
+    if (!document.querySelector('#page-recolour.on') || e.target.matches?.('input:not([type=range]):not([type=checkbox]), select, textarea')) return;
     const key = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && (key === 'y' || (key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
     else if ((e.ctrlKey || e.metaKey) && key === 'z') { e.preventDefault(); undo(); }
@@ -309,7 +310,7 @@ async function decodeImage(file, W, H) {
     alpha[i] = data.data[p + 3];
   }
   img = { w, h, lab0, lab: lab0, alpha, data, png: file.type === 'image/png' && !W && s === 1 && bmp.width === w ? file : null };
-  sel = null; areaOf = new Uint8Array(w * h); areaAlpha = new Uint8Array(w * h).fill(255); areas = [];
+  sel = null; areaOf = new Uint8Array(w * h); areaAlpha = new Uint8Array(w * h).fill(255); areaCore = new Uint8Array(w * h); areas = [];
   undoStack.length = 0; redoStack.length = 0; lastCopy = {}; areaVer++; labelsVer++;
   clusters = []; labels = null; hover = -1; hoverA = 0;
   const cv2 = canvasEl();
@@ -459,7 +460,7 @@ function keepChosenGroups() {
     if (!cnt) return;
     areas.push({ target: c.target || null, lab0: c.lab0, count: cnt, name: c.name, flat: c.flat });
     const id = areas.length;
-    for (let i = 0; i < labels.length; i++) if (labels[i] === ci && !areaOf[i]) { areaOf[i] = id; areaAlpha[i] = 255; }
+    for (let i = 0; i < labels.length; i++) if (labels[i] === ci && !areaOf[i]) { areaOf[i] = id; areaAlpha[i] = 255; areaCore[i] = 1; }
     kept++;
   });
   if (kept) areaVer++;
@@ -730,7 +731,7 @@ function afterSel(full = true) {
 // The tools keep `sel` itself hard, so the slider can be changed back and forth.
 function selNow() {
   if (!sel || !topt.feather || selDragging) return sel;
-  if (softCache.ver !== selVer || softCache.f !== topt.feather) softCache = { ver: selVer, f: topt.feather, m: blurMask(sel, topt.feather) };
+  if (softCache.ver !== selVer || softCache.f !== topt.feather) softCache = { ver: selVer, f: topt.feather, m: outwardSoft(sel, topt.feather) };
   return softCache.m;
 }
 
@@ -799,7 +800,7 @@ function makeGroup(target) {
   pushUndo();
   areas.push({ target, lab0: [L / wt, A / wt, B / wt], count: took, name, flat: topt.flat || undefined, feather: topt.feather || undefined });
   const id = areas.length;
-  for (let i = 0; i < soft.length; i++) if (take[i]) { areaOf[i] = id; areaAlpha[i] = soft[i]; }
+  for (let i = 0; i < soft.length; i++) if (take[i]) { areaOf[i] = id; areaAlpha[i] = soft[i]; areaCore[i] = sel[i] >= 128 ? 1 : 0; }
   areaVer++;
   sel = null;
   tidyAreas();
@@ -831,17 +832,17 @@ function tidyAreas() {
 /* ---------- undo / redo (selections, groups and colours) ---------- */
 // The big per-pixel arrays are only copied when they've changed since the last copy.
 function snapshot() {
-  if (lastCopy.areaVer !== areaVer) lastCopy = { ...lastCopy, areaVer, areaOf: areaOf.slice(), areaAlpha: areaAlpha.slice() };
+  if (lastCopy.areaVer !== areaVer) lastCopy = { ...lastCopy, areaVer, areaOf: areaOf.slice(), areaAlpha: areaAlpha.slice(), areaCore: areaCore.slice() };
   if (lastCopy.labelsVer !== labelsVer) lastCopy = { ...lastCopy, labelsVer, labels: labels.slice() };
   return {
-    areaOf: lastCopy.areaOf, areaAlpha: lastCopy.areaAlpha, areaVer, labels: lastCopy.labels, labelsVer, k,
+    areaOf: lastCopy.areaOf, areaAlpha: lastCopy.areaAlpha, areaCore: lastCopy.areaCore, areaVer, labels: lastCopy.labels, labelsVer, k,
     areas: areas.map(a => ({ ...a })), clusters: clusters.map(c => ({ ...c })), sel: sel && sel.slice(),
   };
 }
 function restore(s) {
-  areaOf = s.areaOf.slice(); areaAlpha = s.areaAlpha.slice(); labels = s.labels.slice();
+  areaOf = s.areaOf.slice(); areaAlpha = s.areaAlpha.slice(); areaCore = s.areaCore ? s.areaCore.slice() : coreFrom(areaAlpha); labels = s.labels.slice();
   areaVer = s.areaVer; labelsVer = s.labelsVer;
-  lastCopy = { areaVer, areaOf: s.areaOf, areaAlpha: s.areaAlpha, labelsVer, labels: s.labels };
+  lastCopy = { areaVer, areaOf: s.areaOf, areaAlpha: s.areaAlpha, areaCore: s.areaCore, labelsVer, labels: s.labels };
   areas = s.areas.map(a => ({ ...a })); clusters = s.clusters.map(c => ({ ...c })); sel = s.sel && s.sel.slice();
   if (s.k !== k) {
     k = s.k;
@@ -892,19 +893,30 @@ function renameRow(row, obj, fallback) {
   inp.onblur = () => finish(true);
 }
 
-// Change the soft edge of one of your groups after it's made: take its hard shape (pixels at least half in it),
-// blur that by the new amount, and let the fade reach into neighbouring pixels that aren't in another of your groups.
+// Change the soft edge of one of your groups after it's made. Always starts from the shape you made (areaCore),
+// so changing it back and forth never wears the shape down, and 0 gives the exact original edge back.
+// The fade only goes outwards: everything inside the shape keeps the full colour, corners included.
 function refeather(j, f) {
   const id = j + 1, n = areaOf.length, hard = new Uint8Array(n);
-  for (let i = 0; i < n; i++) if (areaOf[i] === id && areaAlpha[i] >= 128) hard[i] = 255;
-  const m = blurMask(hard, f);
+  for (let i = 0; i < n; i++) if (areaOf[i] === id && areaCore[i]) hard[i] = 255;
+  const m = outwardSoft(hard, f);
   for (let i = 0; i < n; i++) {
     if (areaOf[i] === id) { if (m[i]) areaAlpha[i] = m[i]; else areaOf[i] = 0; }
-    else if (!areaOf[i] && m[i]) { areaOf[i] = id; areaAlpha[i] = m[i]; }
+    else if (!areaOf[i] && m[i]) { areaOf[i] = id; areaAlpha[i] = m[i]; areaCore[i] = 0; }
   }
   areas[j].feather = f || undefined;
   areaVer++;
 }
+// soft edge that fades outwards from a hard shape (inside stays fully selected)
+function outwardSoft(hard, f) {
+  if (!f) return hard.slice();
+  // blur twice as wide, then lift it so the fade starts at full strength right at the shape's edge
+  const b = blurMask(hard, f * 2), m = new Uint8Array(hard.length);
+  for (let i = 0; i < m.length; i++) m[i] = hard[i] ? 255 : Math.min(255, b[i] * 2);
+  return m;
+}
+// for pictures saved before shapes were kept: the shape is whatever is at least half in the group
+function coreFrom(alpha) { const c = new Uint8Array(alpha.length); for (let i = 0; i < c.length; i++) c[i] = alpha[i] >= 128 ? 1 : 0; return c; }
 
 // Select a group's pixels. Shift (or ＋ Add) adds to what's already selected, Alt (or − Remove) takes it away.
 function selectWhere(test, e, val = () => 255, origin = 'groups') {
@@ -958,8 +970,8 @@ function refreshList() {
       rg.onchange = () => { undone = false; cancelAnimationFrame(raf); refeather(j, +rg.value); draw(); tidyAreas(); autosaveSoon(); };
       r.append(sr);
     }
-    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e, p => areaAlpha[p] >= 128 ? 255 : 0);
-    r.querySelector('[data-inv]').onclick = e => selectWhere(p => !(areaOf[p] === j + 1 && areaAlpha[p] >= 128), e, undefined, 'tools');
+    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1 && areaCore[p], e);
+    r.querySelector('[data-inv]').onclick = e => selectWhere(p => !(areaOf[p] === j + 1 && areaCore[p]), e, undefined, 'tools');
     r.querySelector('[data-eye]').onclick = () => { pushUndo(); a.hidden = !a.hidden || undefined; refreshList(); draw(); };
     r.querySelector('[data-del]').onclick = () => { pushUndo(); for (let i = 0; i < areaOf.length; i++) if (areaOf[i] === j + 1) areaOf[i] = 0; areaVer++; tidyAreas(); draw(); };
     r.onmouseenter = () => { hoverA = j + 1; draw(); };
@@ -1143,7 +1155,7 @@ function thumbnail() {
 async function stateNow(withThumb) {
   return {
     v: 1, id: saved.id, name: saved.name, date: Date.now(), w: img.w, h: img.h, png: await pngOf(),
-    labels, areaOf, areaAlpha, k, adj: { ...adj }, thr: { ...thr }, shade, ignoreBg,
+    labels, areaOf, areaAlpha, areaCore, k, adj: { ...adj }, thr: { ...thr }, shade, ignoreBg,
     clusters: clusters.map(c => ({ ...c })), areas: areas.map(a => ({ ...a })),
     thumb: withThumb ? thumbnail() : undefined,
   };
@@ -1195,7 +1207,7 @@ async function restoreState(st) {
   await reAdjust(false);
   // filaments may have changed since (bought one, renamed it): use the library's copy where there is one
   const fresh = t => t && (store.spoolById(t.id) || t);
-  labels = new Uint8Array(st.labels); areaOf = new Uint8Array(st.areaOf); areaAlpha = new Uint8Array(st.areaAlpha);
+  labels = new Uint8Array(st.labels); areaOf = new Uint8Array(st.areaOf); areaAlpha = new Uint8Array(st.areaAlpha); areaCore = st.areaCore ? new Uint8Array(st.areaCore) : coreFrom(areaAlpha);
   clusters = st.clusters.map(c => ({ ...c, target: fresh(c.target) }));
   areas = st.areas.map(a => ({ ...a, target: fresh(a.target) }));
   labelsVer++; areaVer++; lastCopy = {};
@@ -1218,17 +1230,17 @@ async function restoreCurrent() {
 
 async function fileBytes() {
   const st = await stateNow(false);
-  const meta = { ...st, png: undefined, labels: undefined, areaOf: undefined, areaAlpha: undefined, thumb: undefined, app: 'Filament Studio' };
+  const meta = { ...st, png: undefined, labels: undefined, areaOf: undefined, areaAlpha: undefined, areaCore: undefined, thumb: undefined, app: 'Filament Studio' };
   return zipSync({
     'picture.json': strToU8(JSON.stringify(meta)), 'picture.png': new Uint8Array(await st.png.arrayBuffer()),
-    'labels.bin': labels, 'groups.bin': areaOf, 'soft.bin': areaAlpha,
+    'labels.bin': labels, 'groups.bin': areaOf, 'soft.bin': areaAlpha, 'shape.bin': areaCore,
   });
 }
 async function openFile(file) {
   try {
     const z = unzipSync(new Uint8Array(await file.arrayBuffer()));
     const meta = JSON.parse(strFromU8(z['picture.json']));
-    await restoreState({ ...meta, png: new Blob([z['picture.png']], { type: 'image/png' }), labels: z['labels.bin'], areaOf: z['groups.bin'], areaAlpha: z['soft.bin'], id: null, name: '' });
+    await restoreState({ ...meta, png: new Blob([z['picture.png']], { type: 'image/png' }), labels: z['labels.bin'], areaOf: z['groups.bin'], areaAlpha: z['soft.bin'], areaCore: z['shape.bin'], id: null, name: '' });
     saved = { id: null, name: '' }; showName();
     toast('Opened. Press 💾 Save to keep it in this browser.');
     autosaveSoon();
