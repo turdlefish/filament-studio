@@ -98,6 +98,16 @@ details summary { cursor: pointer; color: var(--muted); margin: .4rem 0; }
 .drop { border: 2px dashed var(--line); border-radius: 12px; min-height: 360px; display: flex; align-items: center; justify-content: center; text-align: center; padding: 1rem; background: repeating-conic-gradient(#f3f1f7 0 25%, #fff 0 50%) 0 0 / 20px 20px; }
 .drop.over { border-color: var(--accent); }
 .drop canvas { max-width: 100%; max-height: 75vh; cursor: crosshair; border-radius: 6px; }
+.drop.has-pic { display: block; position: relative; overflow: hidden; height: 72vh; min-height: 320px; padding: 0; touch-action: none; border-style: solid; }
+.drop.has-pic canvas { position: absolute; left: 0; top: 0; max-width: none; max-height: none; transform-origin: 0 0; border-radius: 0; box-shadow: 0 1px 8px rgba(0,0,0,.15); }
+.drop canvas.pixels { image-rendering: pixelated; }
+.zoom-ctl { display: inline-flex; align-items: center; gap: .15rem; margin-left: auto; }
+.zoom-ctl .icon-btn { font-size: 1.05rem; padding: .15rem .45rem; }
+.zoom-ctl .icon-btn:disabled { opacity: .35; cursor: default; }
+.zoom-ctl b { min-width: 3.2em; text-align: right; color: var(--muted); }
+.cl input.rename { width: 100%; box-sizing: border-box; font: inherit; font-weight: 600; padding: .15rem .35rem; border: 1px solid var(--accent); border-radius: 6px; }
+.cl { flex-wrap: wrap; } .cl .grow { flex: 1 1 8.5rem; min-width: 0; }
+.cl .acts { display: inline-flex; align-items: center; gap: .1rem; margin-left: auto; }
 .side .cl-list { display: grid; gap: .35rem; max-height: 52vh; overflow: auto; }
 .cl { display: flex; align-items: center; gap: .45rem; border: 1px solid var(--line); border-radius: 10px; padding: .35rem .45rem; }
 .cl.sel { border-color: var(--accent); background: var(--accent-soft); } .cl.bg { opacity: .7; }
