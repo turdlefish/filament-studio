@@ -21,7 +21,7 @@ const thr = { on: false, level: 50 }; // threshold: lightness level (0-100) that
 
 // hand-made areas
 let tool = 'pick';        // pick | wand | fill | brush
-const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, feather: 0, flat: false, selMode: 'new' };
+const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, feather: 0, flat: false, selMode: 'new', keepOthers: true };
 let sel = null;           // Uint8Array selection mask, 0-255 (in between = soft edge)
 let areaOf = null;        // Uint8Array: 0 = follow its colour group, n = areas[n-1]
 let areaAlpha = null;     // Uint8Array: how much of its own group's colour a pixel takes (255 = all; less on soft edges)
@@ -70,6 +70,7 @@ export function renderRecolour() {
           <button class="btn small ghost" data-mkgroup title="Make the selected pixels into one group of their own (joins parts together)">Make a group</button>
           <label class="soft-edge" title="Feathers the edge of the selection, so the new colour fades into what's next to it instead of a hard cut. 0 = hard edge.">Soft edge <input type="range" min="0" max="30" value="${topt.feather}" data-feather><b data-featherv>${topt.feather}</b> px</label>
           <label class="check" title="Colour it as one flat filament colour, without the picture's light and shadow"><input type="checkbox" data-flatsel ${topt.flat ? 'checked' : ''}> One solid colour</label>
+          <label class="check" data-keepwrap title="Like painting on a layer underneath: parts of the selection that are already in one of your groups stay in that group. Untick to paint over them."><input type="checkbox" data-keep ${topt.keepOthers ? 'checked' : ''}> Leave my other groups as they are</label>
           <button class="btn ghost small" data-unarea title="Let the selected pixels follow their colour group again">Back to groups</button>
           <button class="btn ghost small" data-invert>Invert</button>
           <button class="btn ghost small" data-none>Clear selection</button>
@@ -117,6 +118,7 @@ export function renderRecolour() {
   $('[data-store]').onclick = saveNamed;
   $('[data-saved]').onclick = showSaved;
   $('[data-flatsel]').onchange = e => { topt.flat = e.target.checked; };
+  $('[data-keep]').onchange = e => { topt.keepOthers = e.target.checked; };
   let featherT;
   $('[data-feather]').oninput = e => {
     topt.feather = +e.target.value; $('[data-featherv]').textContent = topt.feather;
@@ -185,7 +187,7 @@ export function renderRecolour() {
   $('[data-colour]').onclick = colourSelection;
   $('[data-mkgroup]').onclick = () => makeGroup();
   $('[data-unarea]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) if (sel[i] >= 128) areaOf[i] = 0; areaVer++; tidyAreas(); sel = null; afterSel(); };
-  $('[data-invert]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) sel[i] = 255 - sel[i]; afterSel(); };
+  $('[data-invert]').onclick = () => { if (!sel) return; pushUndo(); for (let i = 0; i < sel.length; i++) sel[i] = 255 - sel[i]; selOrigin = 'tools'; afterSel(); };
   $('[data-none]').onclick = () => { if (!sel) return; pushUndo(); sel = null; afterSel(); };
   setupCanvas($('[data-canvas]'));
   setTool('pick');
@@ -581,6 +583,7 @@ function setupCanvas(cv) {
       if (!sel || !add) sel = new Uint8Array(img.w * img.h);
       wandAt(x, y);
       wanding = { last: [x, y], next: null, raf: 0 };
+      selOrigin = 'tools';
       b.setPointerCapture(e.pointerId);
       afterSel(false);
       return;
@@ -589,6 +592,7 @@ function setupCanvas(cv) {
       pushUndo();
       if (!sel) sel = new Uint8Array(img.w * img.h);
       painting = true; b.setPointerCapture(e.pointerId);
+      selOrigin = 'tools';
       last = [x, y];
       dab(x, y, topt.size * scale / 2, mode); afterSel(false);
     }
@@ -706,6 +710,7 @@ function flood(x, y, ok) {
 }
 
 let selVer = 0, selDragging = false, softCache = { ver: -1, f: -1, m: null };
+let selOrigin = 'tools'; // 'groups' when the selection is whole groups picked with ⬚ (to join them)
 function afterSel(full = true) {
   const bar = document.querySelector('#page-recolour [data-selbar]');
   let n = 0; if (sel) for (let i = 0; i < sel.length; i++) n += sel[i];
@@ -714,6 +719,10 @@ function afterSel(full = true) {
   bar.hidden = !sel;
   const f = n / 255 / (sel ? sel.length : 1);
   if (sel) bar.querySelector('[data-selinfo]').textContent = `${(f * 100).toFixed(f < 0.01 ? 2 : 1)}% of the picture selected`;
+  // only matters when the selection overlaps your groups and wasn't made by picking whole groups to join
+  let overlap = false;
+  if (sel && selOrigin !== 'groups') for (let i = 0; i < sel.length; i++) if (sel[i] && areaOf[i]) { overlap = true; break; }
+  bar.querySelector('[data-keepwrap]').hidden = !overlap;
   draw();
 }
 
@@ -765,25 +774,32 @@ function blurMask(src, feather) {
 // Make the selected pixels into one group of their own. Joining groups keeps the colour and name of the biggest part.
 function makeGroup(target) {
   if (!sel) return null;
-  const { mean, n } = selMean();
   if (areas.length >= 250) { toast('That\'s the most groups you can make'); return null; }
+  const keep = topt.keepOthers && selOrigin !== 'groups'; // paint "underneath" your other groups
   let name;
   if (target === undefined) {
     const tally = new Map(); // 'a<n>' / 'c<n>' -> pixels
-    for (let i = 0; i < sel.length; i++) if (sel[i] >= 128) { const key = areaOf[i] ? 'a' + areaOf[i] : 'c' + labels[i]; tally.set(key, (tally.get(key) || 0) + 1); }
+    for (let i = 0; i < sel.length; i++) if (sel[i] >= 128 && !(keep && areaOf[i])) { const key = areaOf[i] ? 'a' + areaOf[i] : 'c' + labels[i]; tally.set(key, (tally.get(key) || 0) + 1); }
     const [top] = [...tally].sort((a, b) => b[1] - a[1]);
     const src = top && (top[0][0] === 'a' ? areas[+top[0].slice(1) - 1] : clusters[+top[0].slice(1)]);
     target = src && !src.bg ? src.target || null : null;
     name = src && top[0][0] === 'a' ? src.name : undefined;
   }
-  pushUndo();
-  areas.push({ target, lab0: mean, count: n, name, flat: topt.flat || undefined, feather: topt.feather || undefined });
-  const id = areas.length, soft = selNow();
+  const soft = selNow(), { lab0 } = img;
+  const take = new Uint8Array(soft.length);
+  let took = 0, L = 0, A = 0, B = 0, wt = 0;
   for (let i = 0; i < soft.length; i++) {
     const s = soft[i];
     if (!s || (s < 128 && areaOf[i])) continue; // faint soft edge: don't take pixels away from another of your groups
-    areaOf[i] = id; areaAlpha[i] = s;
+    if (keep && areaOf[i]) continue;
+    take[i] = 1; took++;
+    L += lab0[i * 3] * s; A += lab0[i * 3 + 1] * s; B += lab0[i * 3 + 2] * s; wt += s;
   }
+  if (!took) { toast('All of that is already in your groups. Untick “Leave my other groups as they are” to colour over them.', 4500); return null; }
+  pushUndo();
+  areas.push({ target, lab0: [L / wt, A / wt, B / wt], count: took, name, flat: topt.flat || undefined, feather: topt.feather || undefined });
+  const id = areas.length;
+  for (let i = 0; i < soft.length; i++) if (take[i]) { areaOf[i] = id; areaAlpha[i] = soft[i]; }
   areaVer++;
   sel = null;
   tidyAreas();
@@ -890,11 +906,13 @@ function refeather(j, f) {
   areaVer++;
 }
 
-// select a group's pixels; Shift adds to what's already selected
-function selectWhere(test, add, val = () => 255) {
+// Select a group's pixels. Shift (or ＋ Add) adds to what's already selected, Alt (or − Remove) takes it away.
+function selectWhere(test, e, val = () => 255, origin = 'groups') {
+  const sub = !!(e && (e.altKey || topt.selMode === 'sub'));
+  const add = sub || !!(e && (e.shiftKey || topt.selMode === 'add'));
   pushUndo();
-  if (!sel || !add) sel = new Uint8Array(labels.length);
-  for (let p = 0; p < labels.length; p++) if (test(p)) sel[p] = Math.max(sel[p], val(p));
+  if (!sel || !add) { sel = new Uint8Array(labels.length); selOrigin = origin; } else if (origin === 'tools') selOrigin = origin;
+  for (let p = 0; p < labels.length; p++) if (test(p)) sel[p] = sub ? 0 : Math.max(sel[p], val(p));
   afterSel();
 }
 
@@ -912,15 +930,15 @@ function refreshList() {
   const live = new Float64Array(clusters.length);
   if (labels) for (let p = 0; p < labels.length; p++) if (!areaOf[p]) live[labels[p]]++;
   const ab = document.querySelector('#page-recolour [data-areas]');
-  ab.innerHTML = areas.length ? '<h3 class="tiny-h">Your groups</h3>' : '';
+  ab.innerHTML = areas.length ? `<h3 class="tiny-h">Your groups <span class="layer-tip">like layers: 👁 hide · ⬚ select · ⇄ select everything else</span></h3>` : '';
   areas.forEach((a, j) => {
-    const r = el('div', { class: 'cl own' + (hoverA === j + 1 ? ' sel' : ''), 'data-ai': j + 1 });
+    const r = el('div', { class: 'cl own' + (hoverA === j + 1 ? ' sel' : '') + (a.hidden ? ' hid' : ''), 'data-ai': j + 1 });
     const t = a.target, auto = t ? t.name : `Group ${j + 1}`;
-    r.innerHTML = `<span class="sw big" style="background:${rgbToHex(...labToRgb(...a.lab0))}"></span><span class="arrow">→</span><span class="sw big" style="background:${t ? swatchCss(t.hex) : hatch}"></span>
+    r.innerHTML = `<button class="icon-btn eye" data-eye title="${a.hidden ? 'Hidden: click to show this group again' : 'Hide this group (see what\'s under it)'}">${a.hidden ? '◌' : '👁'}</button><span class="sw big" style="background:${rgbToHex(...labToRgb(...a.lab0))}"></span><span class="arrow">→</span><span class="sw big" style="background:${t ? swatchCss(t.hex) : hatch}"></span>
       <div class="grow"><b data-name>${esc(a.name || auto)}</b>
       <small class="muted">${pct(a.count)}${a.name && t ? ` · ${esc(t.name)}` : ''}${t ? tline(t) : ' · not changed'}</small></div>
       <span class="acts">${nameBtn}${t ? flatBtn(a) : ''}<button class="btn small ghost" data-pick>${t ? 'Change' : 'Choose'}</button>
-      <button class="icon-btn${a.softOpen ? ' on' : ''}" data-soft title="Soft edge: fade this group's edge into what's next to it">≈</button><button class="icon-btn" data-sel title="Select this group (Shift adds it to the selection)">⬚</button><button class="icon-btn" data-del title="Remove (its pixels go back to their colour groups)">✕</button></span>`;
+      <button class="icon-btn${a.softOpen ? ' on' : ''}" data-soft title="Soft edge: fade this group's edge into what's next to it">≈</button><button class="icon-btn" data-sel title="Select this group (Shift adds it to the selection, Alt takes it away)">⬚</button><button class="icon-btn" data-inv title="Select everything except this group (to colour the rest)">⇄</button><button class="icon-btn" data-del title="Remove (its pixels go back to their colour groups)">✕</button></span>`;
     r.querySelector('[data-ren]').onclick = () => renameRow(r, a, auto);
     r.querySelector('[data-name]').ondblclick = () => renameRow(r, a, auto);
     r.querySelector('[data-pick]').onclick = () => chooseArea(j);
@@ -940,7 +958,9 @@ function refreshList() {
       rg.onchange = () => { undone = false; cancelAnimationFrame(raf); refeather(j, +rg.value); draw(); tidyAreas(); autosaveSoon(); };
       r.append(sr);
     }
-    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey, p => areaAlpha[p] >= 128 ? 255 : 0);
+    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e, p => areaAlpha[p] >= 128 ? 255 : 0);
+    r.querySelector('[data-inv]').onclick = e => selectWhere(p => !(areaOf[p] === j + 1 && areaAlpha[p] >= 128), e, undefined, 'tools');
+    r.querySelector('[data-eye]').onclick = () => { pushUndo(); a.hidden = !a.hidden || undefined; refreshList(); draw(); };
     r.querySelector('[data-del]').onclick = () => { pushUndo(); for (let i = 0; i < areaOf.length; i++) if (areaOf[i] === j + 1) areaOf[i] = 0; areaVer++; tidyAreas(); draw(); };
     r.onmouseenter = () => { hoverA = j + 1; draw(); };
     r.onmouseleave = () => { hoverA = 0; draw(); };
@@ -971,7 +991,7 @@ function refreshList() {
     r.querySelector('[data-clear]')?.addEventListener('click', () => { pushUndo(); c.target = null; refreshList(); draw(); });
     r.querySelector('[data-unbg]')?.addEventListener('click', () => { c.bg = false; refreshList(); draw(); });
     r.querySelector('[data-split]').addEventListener('click', () => splitGroup(i));
-    r.querySelector('[data-gsel]').addEventListener('click', e => selectWhere(p => labels[p] === i && !areaOf[p], e.shiftKey));
+    r.querySelector('[data-gsel]').addEventListener('click', e => selectWhere(p => labels[p] === i && !areaOf[p], e));
     r.onmouseenter = () => { hover = i; draw(); };
     r.onmouseleave = () => { hover = -1; draw(); };
     list.append(r);
@@ -1054,8 +1074,10 @@ function draw(forSave = false) {
     }
     return v;
   };
+  const hid = areas.map(a => !!a.hidden);
   for (let i = 0; i < w * h; i++) {
-    const p = i * 4, c = labels[i], ar = areaOf ? areaOf[i] : 0;
+    const p = i * 4, c = labels[i], ar0 = areaOf ? areaOf[i] : 0;
+    const ar = ar0 && !hid[ar0 - 1] ? ar0 : 0; // a hidden group shows what's under it
     const al = ar ? areaAlpha[i] / 255 : 1; // soft edge: part your group's colour, part what's underneath
     let r = src[p], g = src[p + 1], b = src[p + 2];
     if (preview) { // what the tools see: threshold black/white, or the adjusted picture
@@ -1073,7 +1095,7 @@ function draw(forSave = false) {
         r = r * al + u[0] * (1 - al); g = g * al + u[1] * (1 - al); b = b * al + u[2] * (1 - al);
       }
     }
-    if ((hoverA && ar !== hoverA) || (!hoverA && hover >= 0 && (c !== hover || ar))) { r = r * 0.35 + 38; g = g * 0.35 + 38; b = b * 0.35 + 38; }
+    if ((hoverA && ar0 !== hoverA) || (!hoverA && hover >= 0 && (c !== hover || ar0))) { r = r * 0.35 + 38; g = g * 0.35 + 38; b = b * 0.35 + 38; }
     if (E && E[i] >= topt.edge) { r = 255; g = 40; b = 120; }
     if (sel) {
       // blue tint + checker so it reads on any colour (fading out over a soft edge); the rest dimmed
