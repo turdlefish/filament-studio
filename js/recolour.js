@@ -68,6 +68,7 @@ export function renderRecolour() {
           <span data-selinfo></span>
           <button class="btn small" data-colour>Colour the selection…</button>
           <button class="btn small ghost" data-mkgroup title="Make the selected pixels into one group of their own (joins parts together)">Make a group</button>
+          <label class="soft-edge" title="Feathers the edge of the selection, so the new colour fades into what's next to it instead of a hard cut. 0 = hard edge.">Soft edge <input type="range" min="0" max="30" value="${topt.feather}" data-feather><b data-featherv>${topt.feather}</b> px</label>
           <label class="check" title="Colour it as one flat filament colour, without the picture's light and shadow"><input type="checkbox" data-flatsel ${topt.flat ? 'checked' : ''}> One solid colour</label>
           <button class="btn ghost small" data-unarea title="Let the selected pixels follow their colour group again">Back to groups</button>
           <button class="btn ghost small" data-invert>Invert</button>
@@ -116,6 +117,11 @@ export function renderRecolour() {
   $('[data-store]').onclick = saveNamed;
   $('[data-saved]').onclick = showSaved;
   $('[data-flatsel]').onchange = e => { topt.flat = e.target.checked; };
+  let featherT;
+  $('[data-feather]').oninput = e => {
+    topt.feather = +e.target.value; $('[data-featherv]').textContent = topt.feather;
+    clearTimeout(featherT); featherT = setTimeout(draw, 40);
+  };
   document.addEventListener('paste', e => {
     if (!document.querySelector('#page-recolour.on')) return;
     const it = [...e.clipboardData.items].find(i => i.type.startsWith('image'));
@@ -191,12 +197,11 @@ function setTool(t) {
   root.querySelectorAll('[data-tool] button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   const o = root.querySelector('[data-topts]');
   const outl = `<label class="check"><input type="checkbox" data-to="outlines" ${topt.outlines ? 'checked' : ''}> Show outlines</label>`;
-  const soft = `<label title="Feathers the edge of what you select, so the new colour fades into the next one instead of a hard cut. 0 = hard edge.">Soft edge <input type="range" min="0" max="30" value="${topt.feather}" data-to="feather"><b>${topt.feather}</b> px</label>`;
   o.innerHTML = {
     pick: '',
     wand: `<label>How similar <input type="range" min="1" max="60" value="${topt.tol}" data-to="tol"><b>${topt.tol}</b></label>
-      <label class="check"><input type="checkbox" data-to="contiguous" ${topt.contiguous ? 'checked' : ''}> Only touching pixels</label>${soft}`,
-    fill: `<label>Outline strength <input type="range" min="3" max="60" value="${topt.edge}" data-to="edge"><b>${topt.edge}</b></label>${soft}${outl}`,
+      <label class="check"><input type="checkbox" data-to="contiguous" ${topt.contiguous ? 'checked' : ''}> Only touching pixels</label>`,
+    fill: `<label>Outline strength <input type="range" min="3" max="60" value="${topt.edge}" data-to="edge"><b>${topt.edge}</b></label>${outl}`,
     brush: `<label>Size <input type="range" min="2" max="120" value="${topt.size}" data-to="size"><b>${topt.size}</b></label>`,
     move: '',
   }[t];
@@ -555,7 +560,7 @@ function setupCanvas(cv) {
       const region = tool === 'wand' ? wand(x, y) : fillInside(x, y);
       pushUndo();
       if (!sel || !add) sel = new Uint8Array(img.w * img.h);
-      const m = softMask(region, topt.feather);
+      const m = softMask(region);
       for (let i = 0; i < m.length; i++) if (m[i]) sel[i] = mode ? Math.max(sel[i], m[i]) : Math.round(sel[i] * (255 - m[i]) / 255);
       afterSel();
       return;
@@ -661,32 +666,46 @@ function flood(x, y, ok) {
   return out;
 }
 
+let selVer = 0, selDragging = false, softCache = { ver: -1, f: -1, m: null };
 function afterSel(full = true) {
   const bar = document.querySelector('#page-recolour [data-selbar]');
   let n = 0; if (sel) for (let i = 0; i < sel.length; i++) n += sel[i];
   if (!n) sel = null;
+  selVer++; selDragging = !full;
   bar.hidden = !sel;
   const f = n / 255 / (sel ? sel.length : 1);
   if (sel) bar.querySelector('[data-selinfo]').textContent = `${(f * 100).toFixed(f < 0.01 ? 2 : 1)}% of the picture selected`;
   draw();
 }
 
+// The selection as it will be used: the soft edge (Soft edge slider on the selection bar) blurred in.
+// The tools keep `sel` itself hard, so the slider can be changed back and forth.
+function selNow() {
+  if (!sel || !topt.feather || selDragging) return sel;
+  if (softCache.ver !== selVer || softCache.f !== topt.feather) softCache = { ver: selVer, f: topt.feather, m: blurMask(sel, topt.feather) };
+  return softCache.m;
+}
+
 // mean original colour of the selection, weighted by how strongly each pixel is selected
 function selMean() {
-  const { lab0 } = img; let L = 0, A = 0, B = 0, n = 0, wt = 0;
-  for (let i = 0; i < sel.length; i++) if (sel[i]) { const q = sel[i]; L += lab0[i * 3] * q; A += lab0[i * 3 + 1] * q; B += lab0[i * 3 + 2] * q; wt += q; n++; }
+  const s = selNow(), { lab0 } = img; let L = 0, A = 0, B = 0, n = 0, wt = 0;
+  for (let i = 0; i < s.length; i++) if (s[i]) { const q = s[i]; L += lab0[i * 3] * q; A += lab0[i * 3 + 1] * q; B += lab0[i * 3 + 2] * q; wt += q; n++; }
   return { mean: [L / wt, A / wt, B / wt], n };
 }
 
-// A selected region as a 0-255 mask. With feather > 0 the edge is blurred (three box blurs ≈ a gaussian),
-// so the colour fades over about that many pixels each side of the edge.
-function softMask(region, feather) {
+function softMask(region) {
+  const m = new Uint8Array(img.w * img.h);
+  for (const i of region) m[i] = 255;
+  return m;
+}
+
+// Blur a 0-255 mask (three box blurs ≈ a gaussian) so its edge fades over about `feather` pixels each side.
+function blurMask(src, feather) {
   const { w, h } = img, n = w * h;
   const m = new Uint8Array(n);
-  for (const i of region) m[i] = 255;
-  if (!feather) return m;
+  if (!feather) { m.set(src); return m; }
   const r = Math.max(1, Math.round(feather / 3));
-  let a = Float32Array.from(m), b = new Float32Array(n);
+  let a = Float32Array.from(src), b = new Float32Array(n);
   const pass = (src, dst, horiz) => {
     const len = horiz ? w : h, lines = horiz ? h : w, st = horiz ? 1 : w, ls = horiz ? w : 1, win = 2 * r + 1;
     for (let l = 0; l < lines; l++) {
@@ -720,9 +739,9 @@ function makeGroup(target) {
   }
   pushUndo();
   areas.push({ target, lab0: mean, count: n, name, flat: topt.flat || undefined });
-  const id = areas.length;
-  for (let i = 0; i < sel.length; i++) {
-    const s = sel[i];
+  const id = areas.length, soft = selNow();
+  for (let i = 0; i < soft.length; i++) {
+    const s = soft[i];
     if (!s || (s < 128 && areaOf[i])) continue; // faint soft edge: don't take pixels away from another of your groups
     areaOf[i] = id; areaAlpha[i] = s;
   }
@@ -853,7 +872,7 @@ function refreshList() {
     r.querySelector('[data-name]').ondblclick = () => renameRow(r, a, auto);
     r.querySelector('[data-pick]').onclick = () => chooseArea(j);
     r.querySelector('[data-flat]')?.addEventListener('click', () => { pushUndo(); a.flat = !a.flat || undefined; refreshList(); draw(); });
-    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey, p => areaAlpha[p]);
+    r.querySelector('[data-sel]').onclick = e => selectWhere(p => areaOf[p] === j + 1, e.shiftKey, p => areaAlpha[p] >= 128 ? 255 : 0);
     r.querySelector('[data-del]').onclick = () => { pushUndo(); for (let i = 0; i < areaOf.length; i++) if (areaOf[i] === j + 1) areaOf[i] = 0; areaVer++; tidyAreas(); draw(); };
     r.onmouseenter = () => { hoverA = j + 1; draw(); };
     r.onmouseleave = () => { hoverA = 0; draw(); };
@@ -949,6 +968,7 @@ function draw(forSave = false) {
   const preview = !forSave && adjOpen() && (thr.on || img.adjRGB);
   const labT = preview && thr.on ? img.labT : null, aRGB = preview ? img.adjRGB : null;
   const showEdges = tool === 'fill' && topt.outlines;
+  const S = selNow();
   const E = showEdges ? edgeMap() : null;
   const cache = new Map();
   const sL = 0.35 + shade * 0.65, sC = shade * 0.5;
@@ -989,7 +1009,7 @@ function draw(forSave = false) {
     if (E && E[i] >= topt.edge) { r = 255; g = 40; b = 120; }
     if (sel) {
       // blue tint + checker so it reads on any colour (fading out over a soft edge); the rest dimmed
-      const q = sel[i] / 255, ch = ((i % w) >> 2 ^ (Math.floor(i / w) >> 2)) & 1;
+      const q = S[i] / 255, ch = ((i % w) >> 2 ^ (Math.floor(i / w) >> 2)) & 1;
       const d = 0.75 + 0.25 * q, t = 0.5 * q;
       r = r * d * (1 - t) + (ch ? 40 : 70) * t; g = g * d * (1 - t) + (ch ? 140 : 170) * t; b = b * d * (1 - t) + 255 * t;
     }
