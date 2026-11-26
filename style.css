@@ -189,3 +189,6 @@ table.est { width: 100%; border-collapse: collapse; } table.est td, table.est th
 .saved-row small { display: block; font-size: .74rem; }
 .cl .icon-btn.flat.on { color: var(--accent); background: var(--accent-soft); }
 .sel-bar label.check { font-weight: 600; color: #2d4f9a; }
+.thr { border-top: 1px solid var(--line); margin-top: .4rem; padding-top: .4rem; }
+.hist-wrap { background: #f6f5f9; border-radius: 6px; padding: 4px; margin: .25rem 0; }
+.hist-wrap canvas { display: block; width: 100%; height: 56px; cursor: ew-resize; touch-action: none; }

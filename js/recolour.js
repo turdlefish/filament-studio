@@ -17,6 +17,7 @@ let hover = -1;           // colour group under the mouse in the list
 let shade = 0.6;
 let ignoreBg = true;
 const adj = { exposure: 0, contrast: 0, saturation: 0 };
+const thr = { on: false, level: 50 }; // threshold: lightness level (0-100) that splits black from white
 
 // hand-made areas
 let tool = 'pick';        // pick | wand | fill | brush
@@ -80,9 +81,15 @@ export function renderRecolour() {
         <h2>Colours</h2>
         <details class="adjust" data-adjust>
           <summary>Adjust to separate colours better</summary>
-          <p class="muted tiny">Only changes how colours are told apart, not the finished picture. Brighten dark pictures so the shadows separate, add contrast or colour if similar shades get lumped together.</p>
-          ${[['exposure', 'Exposure', -2, 2, 0.1], ['contrast', 'Contrast', -50, 80, 1], ['saturation', 'Colour strength', -60, 150, 5]].map(([k2, l, mn, mx, st]) =>
+          <p class="muted tiny">While this is open, the picture shows what the magic wand, fill and colour groups see. It doesn't change the finished picture. Brighten dark pictures so the shadows separate; add contrast or colour if similar shades get lumped together.</p>
+          ${[['exposure', 'Exposure', -3, 3, 0.05], ['contrast', 'Contrast', -50, 100, 1], ['saturation', 'Colour strength', -100, 200, 5]].map(([k2, l, mn, mx, st]) =>
             `<label class="tiny slider">${l} <input type="range" min="${mn}" max="${mx}" step="${st}" value="${adj[k2]}" data-adj="${k2}"><b data-adjv="${k2}">${adj[k2]}</b></label>`).join('')}
+          <div class="thr">
+            <label class="check tiny"><input type="checkbox" data-thr> <b>Threshold</b>: black and white only</label>
+            <div class="hist-wrap"><canvas data-hist width="256" height="56"></canvas></div>
+            <label class="tiny slider">Level <input type="range" min="0" max="100" step="0.5" value="${thr.level}" data-thrl><b data-thrv>${thr.level}</b></label>
+            <p class="muted tiny">Everything lighter than the level turns white, everything darker black. Drag the level (or click the ramp) until the shape you want stands on its own. While it's ticked, the 🪄 wand and 🪣 fill pick from the black-and-white picture, so one click selects the whole shape (close this panel to see your colours again; the wand keeps using the threshold until you untick it).</p>
+          </div>
           <button class="link" data-adjreset>Reset</button>
         </details>
         <label class="tiny slider">Colour groups <input type="range" min="2" max="24" value="${k}" data-k><b data-kv>${k}</b></label>
@@ -131,12 +138,34 @@ export function renderRecolour() {
   $('[data-k]').onchange = e => { k = +e.target.value; if (img) analyse(); };
   $('[data-shade]').oninput = e => { shade = +e.target.value; $('[data-shv]').textContent = Math.round(shade * 100) + '%'; draw(); autosaveSoon(); };
   $('[data-bg]').onchange = e => { ignoreBg = e.target.checked; markBg(); refreshList(); draw(); autosaveSoon(); };
-  let adjT;
-  root.querySelectorAll('[data-adj]').forEach(i => i.oninput = () => {
-    adj[i.dataset.adj] = +i.value; $(`[data-adjv="${i.dataset.adj}"]`).textContent = i.value;
-    clearTimeout(adjT); adjT = setTimeout(() => img && reAdjust(), 250);
+  // sliders preview straight away; the colour groups are found again when you let go
+  let adjT, regroupT;
+  root.querySelectorAll('[data-adj]').forEach(i => {
+    i.oninput = () => {
+      adj[i.dataset.adj] = +i.value; $(`[data-adjv="${i.dataset.adj}"]`).textContent = i.value;
+      clearTimeout(adjT); adjT = setTimeout(() => img && reAdjust(false), 60);
+    };
+    i.onchange = () => { clearTimeout(regroupT); regroupT = setTimeout(() => img && reAdjust(true), 300); };
   });
-  $('[data-adjreset]').onclick = () => { Object.assign(adj, { exposure: 0, contrast: 0, saturation: 0 }); root.querySelectorAll('[data-adj]').forEach(i => { i.value = 0; $(`[data-adjv="${i.dataset.adj}"]`).textContent = 0; }); img && reAdjust(); };
+  $('[data-adjreset]').onclick = () => {
+    Object.assign(adj, { exposure: 0, contrast: 0, saturation: 0 }); thr.on = false;
+    root.querySelectorAll('[data-adj]').forEach(i => { i.value = 0; $(`[data-adjv="${i.dataset.adj}"]`).textContent = 0; });
+    $('[data-thr]').checked = false;
+    img && reAdjust();
+  };
+  $('[data-adjust]').ontoggle = () => { draw(); drawHist(); };
+  $('[data-thr]').onchange = e => { thr.on = e.target.checked; if (img) { makeThreshold(); draw(); autosaveSoon(); } drawHist(); };
+  const setLevel = v => {
+    thr.level = Math.round(v * 2) / 2; $('[data-thrl]').value = thr.level; $('[data-thrv]').textContent = thr.level;
+    if (!thr.on) { thr.on = true; $('[data-thr]').checked = true; }
+    if (img) { makeThreshold(); draw(); autosaveSoon(); }
+    drawHist();
+  };
+  $('[data-thrl]').oninput = e => setLevel(+e.target.value);
+  const hc = $('[data-hist]');
+  const histAt = e => { const r = hc.getBoundingClientRect(); setLevel(Math.max(0, Math.min(100, (e.clientX - r.left) / r.width * 100))); };
+  hc.onpointerdown = e => { hc.setPointerCapture(e.pointerId); histAt(e); };
+  hc.onpointermove = e => { if (e.buttons) histAt(e); };
   $('[data-view]').onclick = e => { const v = e.target.dataset.v; if (v) setView(v); };
   $('[data-tool]').onclick = e => { const t = e.target.closest('[data-t]')?.dataset.t; if (t) setTool(t); };
   $('[data-auto]').onclick = autoMatch;
@@ -274,11 +303,10 @@ async function decodeImage(file, W, H) {
 // Exposure / contrast / colour strength, applied to a copy used only for telling colours apart.
 async function reAdjust(thenAnalyse = true) {
   const { exposure, contrast, saturation } = adj;
-  if (!exposure && !contrast && !saturation) img.lab = img.lab0;
+  if (!exposure && !contrast && !saturation) { img.lab = img.lab0; img.adjRGB = null; }
   else {
-    busy('Adjusting…'); await nextFrame();
     const { data, w, h } = img, d = data.data;
-    const lab = new Float32Array(w * h * 3), cache = new Map();
+    const lab = new Float32Array(w * h * 3), rgbOut = new Uint8ClampedArray(w * h * 4), cache = new Map();
     const ev = Math.pow(2, exposure), c = 1 + contrast / 100, sat = 1 + saturation / 100;
     const lin = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
     const srgb = v => { v = Math.max(0, Math.min(1, v)); return 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055); };
@@ -286,17 +314,52 @@ async function reAdjust(thenAnalyse = true) {
       const key = (d[p] << 16) | (d[p + 1] << 8) | d[p + 2];
       let L = cache.get(key);
       if (!L) {
+        // exposure in stops (on linear light, like a camera), then contrast around mid grey, then colour strength
         const rgb = [d[p], d[p + 1], d[p + 2]].map(v => { let x = srgb(lin(v) * ev) / 255; x = (x - 0.5) * c + 0.5; return Math.max(0, Math.min(255, x * 255)); });
-        L = rgbToLab(rgb[0], rgb[1], rgb[2]); L = [L[0], L[1] * sat, L[2] * sat];
+        const l0 = rgbToLab(rgb[0], rgb[1], rgb[2]);
+        const l1 = [l0[0], l0[1] * sat, l0[2] * sat];
+        L = [...l1, ...labToRgb(...l1)];
         cache.set(key, L);
       }
       lab[i * 3] = L[0]; lab[i * 3 + 1] = L[1]; lab[i * 3 + 2] = L[2];
+      rgbOut[p] = L[3]; rgbOut[p + 1] = L[4]; rgbOut[p + 2] = L[5]; rgbOut[p + 3] = d[p + 3];
     }
-    img.lab = lab;
-    busy(false);
+    img.lab = lab; img.adjRGB = rgbOut;
   }
+  makeThreshold();
+  drawHist();
+  if (thenAnalyse) await analyse(); else draw();
+}
+
+// Threshold: a black-and-white copy (lighter than the level = white) that the wand and fill use while it's on.
+function makeThreshold() {
   edges = null;
-  if (thenAnalyse) await analyse();
+  if (!thr.on) { img.labT = null; return; }
+  const { lab } = img, n = img.w * img.h, t = new Float32Array(n * 3), lv = thr.level;
+  for (let i = 0; i < n; i++) t[i * 3] = lab[i * 3] >= lv ? 100 : 0;
+  img.labT = t;
+}
+const toolLab = () => img.labT || img.lab;
+const adjOpen = () => !!document.querySelector('#page-recolour [data-adjust]')?.open;
+
+// lightness histogram of the adjusted picture, with the threshold level marked (like Photoshop's Threshold ramp)
+function drawHist() {
+  const hc = document.querySelector('#page-recolour [data-hist]'); if (!hc) return;
+  const cx = hc.getContext('2d'), W = hc.width, H = hc.height;
+  cx.clearRect(0, 0, W, H);
+  // ramp under the bars: black to white
+  const g = cx.createLinearGradient(0, 0, W, 0); g.addColorStop(0, '#000'); g.addColorStop(1, '#fff');
+  cx.fillStyle = g; cx.fillRect(0, H - 6, W, 6);
+  if (img) {
+    const bins = new Float64Array(128), { lab } = img, n = img.w * img.h;
+    for (let i = 0; i < n; i++) bins[Math.min(127, Math.max(0, Math.floor(lab[i * 3] / 100 * 128)))]++;
+    const max = Math.max(...[...bins].sort((a, b) => b - a).slice(2, 3), 1); // ignore the two tallest spikes (flat backgrounds)
+    cx.fillStyle = '#6b6680';
+    for (let b = 0; b < 128; b++) { const bh = Math.min(1, bins[b] / max) * (H - 9); cx.fillRect(b * 2, H - 7 - bh, 2, bh); }
+  }
+  const x = thr.level / 100 * W;
+  cx.fillStyle = thr.on ? '#d6336c' : 'rgba(214,51,108,.45)'; cx.fillRect(x - 1, 0, 2, H);
+  cx.beginPath(); cx.moveTo(x - 5, H); cx.lineTo(x + 5, H); cx.lineTo(x, H - 8); cx.fill();
 }
 
 /* ---------- colour groups (k-means in Lab) ---------- */
@@ -337,23 +400,49 @@ function nearestC(C, kk, l, a, b) {
 async function analyse() {
   busy('Finding the main colours…'); await nextFrame();
   const { w, h, lab, alpha } = img, n = w * h;
-  const step = Math.max(1, Math.floor(n / 60000));
+  let kept = 0;
+  if (labels && clusters.length) {
+    pushUndo(); // so finding the groups again can be undone
+    kept = keepChosenGroups();
+  }
+  // find the groups among the pixels that aren't in one of your own groups
+  const free = i => alpha[i] > 128 && !(areaOf && areaOf[i]);
+  let nFree = 0; for (let i = 0; i < n; i++) if (free(i)) nFree++;
+  const step = Math.max(1, Math.floor((nFree || n) / 60000));
   const pts = [];
-  for (let i = 0; i < n; i += step) if (alpha[i] > 128) pts.push(i);
+  for (let i = 0, j = 0; i < n; i++) if (!nFree || free(i)) { if (j++ % step === 0) pts.push(i); }
   // shuffle so k-means++ starts somewhere random
   for (let i = pts.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pts[i], pts[j]] = [pts[j], pts[i]]; }
   const P = new Float32Array(pts.length * 3);
   pts.forEach((p, j) => P.set(lab.subarray(p * 3, p * 3 + 3), j * 3));
-  const C = kmeans(P, pts.length, k);
-  const kk = k;
-  if (labels && clusters.length) pushUndo(); // so changing the number of groups can be undone
+  const kk = Math.max(1, Math.min(k, pts.length));
+  const C = kmeans(P, pts.length, kk);
   labels = new Uint8Array(n); labelsVer++;
   for (let i = 0; i < n; i++) labels[i] = nearestC(C, kk, lab[i * 3], lab[i * 3 + 1], lab[i * 3 + 2]);
-  const old = clusters;
   clusters = [...Array(kk)].map((_, c) => ({ lab: [C[c * 3], C[c * 3 + 1], C[c * 3 + 2]] }));
-  finishClusters(old);
+  finishClusters([]);
   busy(false);
   refreshList(); draw();
+  if (kept) toast(`Kept ${kept} group${kept === 1 ? '' : 's'} you'd coloured or named (in “Your groups”)`);
+  autosaveSoon();
+}
+
+// Before the colour groups are found again, any group you've coloured, named or made solid becomes one of
+// "Your groups", so it stays exactly as it is.
+function keepChosenGroups() {
+  let kept = 0;
+  clusters.forEach((c, ci) => {
+    if (c.bg || !(c.target || c.name || c.flat) || areas.length >= 250) return;
+    let cnt = 0;
+    for (let i = 0; i < labels.length; i++) if (labels[i] === ci && !areaOf[i]) cnt++;
+    if (!cnt) return;
+    areas.push({ target: c.target || null, lab0: c.lab0, count: cnt, name: c.name, flat: c.flat });
+    const id = areas.length;
+    for (let i = 0; i < labels.length; i++) if (labels[i] === ci && !areaOf[i]) { areaOf[i] = id; areaAlpha[i] = 255; }
+    kept++;
+  });
+  if (kept) areaVer++;
+  return kept;
 }
 
 // counts, original-colour means, sort big → small, keep earlier choices where the colour is about the same
@@ -521,7 +610,7 @@ function dab(cx, cy, r, v) {
 }
 
 function wand(x, y) {
-  const { w, h, lab } = img, s = (y * w + x) * 3;
+  const { w, h } = img, lab = toolLab(), s = (y * w + x) * 3;
   const L = lab[s], A = lab[s + 1], B = lab[s + 2], t2 = topt.tol * topt.tol;
   const near = i => { const dl = lab[i * 3] - L, da = lab[i * 3 + 1] - A, db = lab[i * 3 + 2] - B; return dl * dl + da * da + db * db <= t2; };
   if (!topt.contiguous) { const out = []; for (let i = 0; i < w * h; i++) if (near(i)) out.push(i); return out; }
@@ -531,7 +620,7 @@ function wand(x, y) {
 // Sobel edge strength on the adjusted lightness + colour, so outlines and colour borders both count.
 function edgeMap() {
   if (edges) return edges;
-  const { w, h, lab } = img;
+  const { w, h } = img, lab = toolLab();
   edges = new Float32Array(w * h);
   const g = (x, y, q) => lab[(Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 3 + q];
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -845,7 +934,7 @@ function summary() {
 }
 
 /* ---------- drawing ---------- */
-function draw() {
+function draw(forSave = false) {
   if (!img || !labels) return;
   const cv = document.querySelector('#page-recolour [data-canvas]');
   const cx = cv.getContext('2d');
@@ -856,6 +945,9 @@ function draw() {
   const atl = areas.map(a => a.target ? hexToLab(a.target.hex[0]) : null);
   const mk = clusters.map(c => [...labToRgb(...c.lab0)]);
   const mka = areas.map(a => [...labToRgb(...a.lab0)]);
+  // while "Adjust" is open, show the picture the way the tools see it
+  const preview = !forSave && adjOpen() && (thr.on || img.adjRGB);
+  const labT = preview && thr.on ? img.labT : null, aRGB = preview ? img.adjRGB : null;
   const showEdges = tool === 'fill' && topt.outlines;
   const E = showEdges ? edgeMap() : null;
   const cache = new Map();
@@ -878,7 +970,10 @@ function draw() {
     const p = i * 4, c = labels[i], ar = areaOf ? areaOf[i] : 0;
     const al = ar ? areaAlpha[i] / 255 : 1; // soft edge: part your group's colour, part what's underneath
     let r = src[p], g = src[p + 1], b = src[p + 2];
-    if (view === 'mask') {
+    if (preview) { // what the tools see: threshold black/white, or the adjusted picture
+      if (labT) r = g = b = labT[i * 3] ? 255 : 0;
+      else if (aRGB) { r = aRGB[p]; g = aRGB[p + 1]; b = aRGB[p + 2]; }
+    } else if (view === 'mask') {
       [r, g, b] = ar ? mka[ar - 1] : mk[c];
       if (al < 1) { const u = mk[c]; r = r * al + u[0] * (1 - al); g = g * al + u[1] * (1 - al); b = b * al + u[2] * (1 - al); }
     } else if (view === 'after') {
@@ -929,7 +1024,7 @@ async function pngOf() {
 // small picture of the result for the Saved list
 function thumbnail() {
   const was = [hover, hoverA, sel, view];
-  hover = -1; hoverA = 0; sel = null; view = 'after'; draw();
+  hover = -1; hoverA = 0; sel = null; view = 'after'; draw(true);
   const s = Math.min(1, 220 / Math.max(img.w, img.h)), t = el('canvas', { width: Math.round(img.w * s), height: Math.round(img.h * s) });
   t.getContext('2d').drawImage(canvasEl(), 0, 0, t.width, t.height);
   [hover, hoverA, sel, view] = was; draw();
@@ -938,7 +1033,7 @@ function thumbnail() {
 async function stateNow(withThumb) {
   return {
     v: 1, id: saved.id, name: saved.name, date: Date.now(), w: img.w, h: img.h, png: await pngOf(),
-    labels, areaOf, areaAlpha, k, adj: { ...adj }, shade, ignoreBg,
+    labels, areaOf, areaAlpha, k, adj: { ...adj }, thr: { ...thr }, shade, ignoreBg,
     clusters: clusters.map(c => ({ ...c })), areas: areas.map(a => ({ ...a })),
     thumb: withThumb ? thumbnail() : undefined,
   };
@@ -980,10 +1075,11 @@ async function restoreState(st) {
   busy('Opening…'); await nextFrame();
   await decodeImage(st.png, st.w, st.h);
   img.png = st.png;
-  Object.assign(adj, st.adj || {}); shade = st.shade ?? shade; ignoreBg = st.ignoreBg ?? ignoreBg; k = st.k || k;
+  Object.assign(adj, st.adj || {}); Object.assign(thr, st.thr || { on: false }); shade = st.shade ?? shade; ignoreBg = st.ignoreBg ?? ignoreBg; k = st.k || k;
   const R = document.getElementById('page-recolour');
   R.querySelectorAll('[data-adj]').forEach(i => { i.value = adj[i.dataset.adj]; R.querySelector(`[data-adjv="${i.dataset.adj}"]`).textContent = adj[i.dataset.adj]; });
   R.querySelector('[data-shade]').value = shade; R.querySelector('[data-shv]').textContent = Math.round(shade * 100) + '%';
+  R.querySelector('[data-thr]').checked = thr.on; R.querySelector('[data-thrl]').value = thr.level; R.querySelector('[data-thrv]').textContent = thr.level;
   R.querySelector('[data-bg]').checked = ignoreBg;
   R.querySelector('[data-k]').value = Math.min(24, k); R.querySelector('[data-kv]').textContent = k;
   await reAdjust(false);
@@ -1097,7 +1193,7 @@ async function showSaved() {
 
 function savePicture() {
   const was = [hover, hoverA, sel, view, tool];
-  hover = -1; hoverA = 0; sel = null; view = 'after'; tool = 'pick'; draw();
+  hover = -1; hoverA = 0; sel = null; view = 'after'; tool = 'pick'; draw(true);
   document.querySelector('#page-recolour [data-canvas]').toBlob(b => {
     const a = el('a', { href: URL.createObjectURL(b), download: 'recoloured.png' }); a.click();
     [hover, hoverA, sel, view, tool] = was; draw();
