@@ -21,7 +21,7 @@ const thr = { on: false, level: 50 }; // threshold: lightness level (0-100) that
 
 // hand-made areas
 let tool = 'pick';        // pick | wand | fill | brush
-const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, feather: 0, flat: false };
+const topt = { tol: 12, contiguous: true, edge: 18, size: 12, outlines: false, feather: 0, flat: false, selMode: 'new' };
 let sel = null;           // Uint8Array selection mask, 0-255 (in between = soft edge)
 let areaOf = null;        // Uint8Array: 0 = follow its colour group, n = areas[n-1]
 let areaAlpha = null;     // Uint8Array: how much of its own group's colour a pixel takes (255 = all; less on soft edges)
@@ -133,6 +133,7 @@ export function renderRecolour() {
     if ((e.ctrlKey || e.metaKey) && (key === 'y' || (key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
     else if ((e.ctrlKey || e.metaKey) && key === 'z') { e.preventDefault(); undo(); }
     if (e.key === 'Escape' && sel) { pushUndo(); sel = null; afterSel(); }
+    if (e.key === 'Alt') e.preventDefault(); // don't let Alt jump to the browser menu while selecting
     if (e.key === ' ' && img) { e.preventDefault(); if (!spaceDown) { spaceDown = true; cursor(); } }
     if ((e.key === '+' || e.key === '=') && img) zoomBy(1.25);
     if (e.key === '-' && img) zoomBy(0.8);
@@ -197,7 +198,10 @@ function setTool(t) {
   root.querySelectorAll('[data-tool] button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   const o = root.querySelector('[data-topts]');
   const outl = `<label class="check"><input type="checkbox" data-to="outlines" ${topt.outlines ? 'checked' : ''}> Show outlines</label>`;
-  o.innerHTML = {
+  // New / Add / Remove, like Photoshop's selection modes (Shift and Alt still work as shortcuts)
+  const modes = `<span class="seg mini selmode" data-selmode>${[['new', 'New', 'Each click starts a new selection'], ['add', '＋ Add', 'Clicks and drags add to the selection (or hold Shift)'], ['sub', '− Remove', 'Clicks and drags take away from the selection (or hold Alt)']]
+    .map(([m, l, ti]) => `<button data-m="${m}" title="${ti}" class="${topt.selMode === m ? 'on' : ''}">${l}</button>`).join('')}</span>`;
+  o.innerHTML = (['wand', 'fill', 'brush'].includes(t) ? modes : '') + {
     pick: '',
     wand: `<label>How similar <input type="range" min="1" max="60" value="${topt.tol}" data-to="tol"><b>${topt.tol}</b></label>
       <label class="check"><input type="checkbox" data-to="contiguous" ${topt.contiguous ? 'checked' : ''}> Only touching pixels</label>`,
@@ -205,6 +209,12 @@ function setTool(t) {
     brush: `<label>Size <input type="range" min="2" max="120" value="${topt.size}" data-to="size"><b>${topt.size}</b></label>`,
     move: '',
   }[t];
+  o.querySelector('[data-selmode]')?.addEventListener('click', e => {
+    const m = e.target.closest('[data-m]')?.dataset.m; if (!m) return;
+    topt.selMode = m;
+    o.querySelectorAll('[data-selmode] button').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+    cursor();
+  });
   o.querySelectorAll('[data-to]').forEach(i => i.addEventListener(i.type === 'checkbox' ? 'change' : 'input', () => {
     topt[i.dataset.to] = i.type === 'checkbox' ? i.checked : +i.value;
     if (i.type === 'range') i.nextElementSibling.textContent = i.value;
@@ -212,9 +222,9 @@ function setTool(t) {
   }));
   root.querySelector('[data-hint]').textContent = {
     pick: 'Click the picture to choose a filament for that colour group.',
-    wand: 'Click a colour to select it; keep the button down and drag to add more patches. Shift-click adds, Alt takes away. Then press "Colour the selection".',
-    fill: 'Click inside an outlined area to select it (stops at lines and edges); drag across more areas to add them. Lower the outline strength if it leaks out. Shift adds, Alt takes away.',
-    brush: 'Drag to paint a selection. Hold Alt to rub it out.',
+    wand: 'Click a colour to select it; keep the button down and drag to take in more patches. Pick − Remove (or hold Alt) to take patches back out, ＋ Add (or hold Shift) to keep adding. Then press "Colour the selection".',
+    fill: 'Click inside an outlined area to select it (stops at lines and edges); drag across more areas to take them in. − Remove (or Alt) takes areas back out, ＋ Add (or Shift) adds. Lower the outline strength if it leaks out.',
+    brush: 'Drag to paint a selection. − Remove (or hold Alt) rubs it out.',
     move: 'Drag to move around. Scroll the mouse wheel (or pinch) to zoom.',
   }[t] + (t === 'move' ? '' : ' Scroll to zoom; hold Space or the right mouse button and drag to move around.');
   cursor();
@@ -263,7 +273,11 @@ function zoomBy(f, cx, cy) {
 }
 function cursor() {
   const cv = canvasEl(); if (!cv) return;
-  cv.style.cursor = spaceDown || tool === 'move' ? 'grab' : tool === 'pick' ? 'pointer' : 'crosshair';
+  // crosshair with a small + or − so you can tell which way a click goes
+  const sign = topt.selMode === 'sub' ? '<path d="M15 19h7" stroke="%23000" stroke-width="3"/><path d="M15 19h7" stroke="%23fff" stroke-width="1.4"/>'
+    : topt.selMode === 'add' ? '<path d="M15 19h7M18.5 15.5v7" stroke="%23000" stroke-width="3"/><path d="M15 19h7M18.5 15.5v7" stroke="%23fff" stroke-width="1.4"/>' : '';
+  const cross = `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M8 1v14M1 8h14" stroke="%23000" stroke-width="3"/><path d="M8 1v14M1 8h14" stroke="%23fff" stroke-width="1.2"/>${sign}</svg>') 8 8, crosshair`;
+  cv.style.cursor = spaceDown || tool === 'move' ? 'grab' : tool === 'pick' ? 'pointer' : cross;
 }
 
 /* ---------- loading & adjusting ---------- */
@@ -554,8 +568,8 @@ function setupCanvas(cv) {
     if (e.button !== 0 || e.target !== cv) return;
     const [x, y, scale] = pos(e);
     if (x < 0 || y < 0 || x >= img.w || y >= img.h) return;
-    mode = e.altKey ? 0 : 1;
-    const add = e.shiftKey || e.altKey;
+    mode = e.altKey || topt.selMode === 'sub' ? 0 : 1;
+    const add = e.shiftKey || e.altKey || topt.selMode !== 'new';
     const i0 = y * img.w + x;
     if (tool === 'pick') {
       if (areaOf[i0]) { const a = areaOf[i0]; hoverA = a; hover = -1; refreshList(); draw(); document.querySelector(`#page-recolour [data-ai="${a}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); chooseArea(a - 1); return; }

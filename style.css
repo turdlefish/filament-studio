@@ -198,3 +198,6 @@ table.est { width: 100%; border-collapse: collapse; } table.est td, table.est th
 .cl .soft-row { flex: 1 1 100%; display: flex; align-items: center; gap: .4rem; font-size: .8rem; font-weight: 600; color: #2d4f9a; padding: .2rem .1rem 0; }
 .cl .soft-row input { flex: 1; min-width: 5rem; }
 .cl .icon-btn.on { color: var(--accent); background: var(--accent-soft); }
+.pic-tools .selmode button { font-size: .78rem; padding: .2rem .55rem; }
+.pic-tools .selmode button[data-m="sub"].on { background: #fde3e8; color: #b4233f; }
+.pic-tools .selmode button[data-m="add"].on { background: #e3f1e6; color: #1f7a3a; }
